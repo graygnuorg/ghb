@@ -30,7 +30,7 @@ import (
 	"sort"
 	"github.com/pborman/getopt/v2"
 	"gopkg.in/yaml.v2"
-	//"github.com/graygnuorg/go-gdbm"
+	"github.com/graygnuorg/go-gdbm"
 )
 
 type Config struct {
@@ -343,12 +343,16 @@ type Token struct {
 	Start Locus
 }
 
-func (t *Token) EOF() bool {
+func (t *Token) IsEOF() bool {
 	return t.Type == TokenEOF
 }
 
 func (t *Token) IsText() bool {
 	return t.Type == TokenWord || t.Type == TokenString
+}
+
+func (t *Token) IsWS() bool {
+	return t.Type == TokenWS || t.Type == TokenComment
 }
 
 type Lexer struct {
@@ -616,7 +620,7 @@ func (l *Lexer) NextToken() (token *Token, err error) {
 func (l *Lexer) NextNWSToken() (token *Token, err error) {
 	for {
 		token, err = l.NextToken()
-		if !(token.Type == TokenWS || token.Type == TokenComment) {
+		if err != nil || token.IsEOF() || !token.IsWS() {
 			break
 		}
 	}
@@ -630,7 +634,7 @@ func (l *Lexer) SkipStatement() error {
 		if err != nil {
 			return err
 		}
-		if t.EOF() {
+		if t.IsEOF() {
 			break
 		}
 		if t.Type == TokenPunct {
@@ -656,7 +660,7 @@ func (l *Lexer) SkipBlock() error {
 		if err != nil {
 			return err
 		}
-		if t.EOF() {
+		if t.IsEOF() {
 			break
 		}
 
@@ -683,6 +687,7 @@ type Runner struct {
 	Num int
 	TokenStart int
 	TokenEnd int
+	Dir string
 }
 
 type PiesConfig struct {
@@ -697,7 +702,7 @@ func (pc *PiesConfig) ParseControl(l *Lexer) error {
 	if err != nil {
 		return err
 	}
-	if t.EOF() {
+	if t.IsEOF() {
 		return nil
 	}
 
@@ -748,7 +753,7 @@ func (pc *PiesConfig) ParseComponent(l *Lexer) error {
 	if err != nil {
 		return err
 	}
-	if t.EOF() {
+	if t.IsEOF() {
 		return nil
 	}
 
@@ -769,7 +774,20 @@ func (pc *PiesConfig) ParseComponent(l *Lexer) error {
 	}
 	if runnerName != "" {
 		r.TokenEnd = len(l.tokens) - 1
-		pc.Runners[runnerName] = append(pc.Runners[runnerName], r)
+		var i int
+		for i = r.TokenStart; i < r.TokenEnd; i += 1 {
+			if l.tokens[i].Type == TokenWord && l.tokens[i].Text == `chdir` {
+				i += 1
+				break
+			}
+		}
+		for i < r.TokenEnd && l.tokens[i].IsWS() {
+			i += 1
+		}
+		if i < r.TokenEnd && l.tokens[i].IsText() {
+			r.Dir = l.tokens[i].Text
+			pc.Runners[runnerName] = append(pc.Runners[runnerName], r)
+		}
 	}
 	return nil
 }
@@ -812,7 +830,7 @@ func ParsePiesConfig(filename string) (*PiesConfig, error) {
 		if err != nil {
 			return nil, err
 		}
-		if t.EOF() {
+		if t.IsEOF() {
 			break
 		}
 
@@ -845,7 +863,7 @@ func (pc *PiesConfig) AddRunner(name string) error {
 	//	if err != nil {
 	//		return err
 	//	}
-	//	if t.EOF() {
+	//	if t.IsEOF() {
 	//		break
 	//	}
 	// }
@@ -924,6 +942,46 @@ func PiesReloadConfig(controlURL *url.URL) error {
 	}
 
 	return nil
+}
+
+func SaveToken(name, token string) error {
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeWrcreat)
+	if err != nil {
+		return fmt.Errorf("can't open database file %s for update: %v", dbname, err)
+	}
+	defer db.Close()
+	if err := db.Store([]byte(name), []byte(token), true); err != nil {
+		return fmt.Errorf("can't store key %s: %v", name, err)
+	}
+	return nil
+}
+
+func FetchToken(name string) (string, error) {
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeReader)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = gdbm.ErrItemNotFound
+		}
+		return "", err
+	}
+	defer db.Close()
+	if ret, err := db.Fetch([]byte(name)); err == nil {
+		return string(ret), nil
+	} else {
+		return "", err
+	}
+}
+
+func DeleteToken(name string) error {
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeWrcreat)
+	if err != nil {
+		return fmt.Errorf("can't open database file %s for update: %v", dbname, err)
+	}
+	defer db.Close()
+	return db.Delete([]byte(name))
 }
 
 type Action struct {
@@ -1005,7 +1063,7 @@ func ListAction(args []string) {
 		fmt.Printf("%-32.32s %4d %d\n", p, len(pc.Runners[p]), pc.Runners[p][len(pc.Runners[p])-1].Num + 1)
 		if verbose {
 			for _, r := range pc.Runners[p] {
-				fmt.Printf(" %d: %s - %s\n", r.Num, pc.Tokens[r.TokenStart].Start, pc.Tokens[r.TokenEnd].Start)
+				fmt.Printf(" %d: %s %s - %s\n", r.Num, r.Dir, pc.Tokens[r.TokenStart].Start, pc.Tokens[r.TokenEnd].Start)
 			}
 		}
 	}
@@ -1058,6 +1116,11 @@ func AddAction(args []string) {
 	name := ProjectName + `_` + strconv.Itoa(n)
 	// FIXME: check if dirname exists
 
+	if err := SaveToken(name, ProjectToken); err != nil {
+		log.Printf("failed to save token for %s: %v", name, err)
+		log.Printf("continuing anyway")
+	}
+
 	if err := InstallToDir(name, ProjectUrl, ProjectToken, labels); err != nil {
 		log.Fatal(err)
 	}
@@ -1072,6 +1135,51 @@ func AddAction(args []string) {
 
 	if err := PiesReloadConfig(pc.ControlURL); err != nil {
 		log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
+	}
+}
+
+func RemoveRunner(name, dirname string) {
+	token, err := FetchToken(name)
+	if err != nil {
+		log.Printf("can't find token for %s: %v", name, err)
+		log.Printf("directory %s left in place")
+		return
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Printf("Can't get cwd: %v", err)
+		return
+	}
+	defer os.Chdir(cwd)
+
+	err = os.Chdir(dirname)
+	if err != nil {
+		log.Printf("can't chdir to %s: %v", dirname, err)
+	}
+
+	cmd := exec.Command("./config.sh", "remove", "--token", token)
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("Error removing %s: %v", name, err)
+		return
+	}
+
+	err = os.Chdir(cwd)
+	if err != nil {
+		log.Printf("can't chdir to %s: %v", cwd, err)
+	}
+
+	if err = DeleteToken(name); err != nil {
+		log.Printf("failed to delete token for %s: %v", name, err)
+	}
+
+	err = os.RemoveAll(dirname)
+	if err != nil {
+		log.Printf("failed to remove %s: %v", dirname, err)
 	}
 }
 
@@ -1131,7 +1239,8 @@ func DeleteAction(args []string) {
 		if err := PiesReloadConfig(pc.ControlURL); err != nil {
 			log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
 		}
-		// FIXME: run ./config.sh remove --token T
+
+		RemoveRunner(projectName + `_` + strconv.Itoa(runnerNum), r[i].Dir)
 	} else {
 		log.Fatalf("%s: no runner %d", projectName, runnerNum)
 	}
