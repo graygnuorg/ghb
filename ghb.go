@@ -1,12 +1,18 @@
+// THE BEER-WARE LICENSE" (Revision 42):
+// <gray@gnu.org> wrote this file.  As long as you retain this notice you
+// can do whatever you want with this stuff. If we meet some day, and you
+// think this stuff is worth it, you can buy me a beer in return.
+
 package main
 
 import (
 	"os"
+	"os/exec"
+	"os/user"
 	"net/http"
 	"io"
 	"fmt"
 	"path/filepath"
-	"os/exec"
 	"log"
 	"strings"
 	"unicode"
@@ -15,39 +21,175 @@ import (
 	"io/ioutil"
 	"regexp"
 	"strconv"
+	"syscall"
 	"errors"
 	"net"
 	"net/url"
 	"text/template"
 	"context"
+	"sort"
 	"github.com/pborman/getopt/v2"
+	"gopkg.in/yaml.v2"
 	//"github.com/graygnuorg/go-gdbm"
 )
 
 type Config struct {
-	Url string
-	RootDir string
-	CacheDir string
-	Tar string
-	PiesConfigFile string
-	ComponentTemplate string
+	Url string                `yaml:"url"`
+	RootDir string            `yaml:"root_dir"`
+	RunnersDir string         `yaml:"runners_dir"`
+	CacheDir string           `yaml:"cache_dir"`
+	Tar string                `yaml:"tar"`
+	PiesConfigFile string     `yaml:"pies_config_file"`
+	ComponentTemplate string  `yaml:"component_template"`
 }
 
 var config = Config{
 	Url: `https://github.com/actions/runner/releases/download/v2.294.0/actions-runner-linux-x64-2.294.0.tar.gz`,
-	RootDir: `/tmp/GHB`,
-	CacheDir: `/tmp/ghb.cache`,
+	RunnersDir: ``,
+	CacheDir: ``,
 	Tar: `tar`,
-	PiesConfigFile: `/home/gray/exp/ghb/pies.conf`,
+	PiesConfigFile: ``,
 	ComponentTemplate: `component {{ RunnerName }} {
-        mode respawn;
-        chdir "{{ Config.RootDir }}/{{ RunnerName }}";
-        stderr syslog daemon.err;
-        stdout syslog daemon.info;
+	mode respawn;
+	chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
+	stderr syslog daemon.err;
+	stdout syslog daemon.info;
 	flags siggroup;
-        command "./run.sh";
+	command "./run.sh";
 }
 `,
+}
+
+var PiesConfigStub = `
+pidfile {{ Config.RootDir }}/pies.pid;
+control {
+	socket "inet://127.0.0.1:8073";
+}
+`
+
+func GetHomeDir() (dir string) {
+	dir = os.Getenv("HOME")
+	if dir == "" {
+		if user, err := user.Current(); err == nil {
+			dir = user.HomeDir
+		} else {
+			dir = "/"
+		}
+	}
+	return
+}
+
+func CheckDir(dirname string) error {
+	st, err := os.Stat(dirname)
+	switch {
+	case os.IsNotExist(err):
+		fmt.Printf("Creating directory %s\n", dirname)
+		err := os.MkdirAll(dirname, 0750)
+		if err != nil {
+			return fmt.Errorf("Can't create directory %s: %v", dirname, err)
+		}
+	case err == nil:
+		if !st.IsDir() {
+			return fmt.Errorf("%s exists, but is not a directory", dirname)
+		}
+
+	default:
+		return fmt.Errorf("can't stat %s: %v", dirname, err)
+	}
+	return nil
+}
+
+func ReadConfig() {
+	var config_file_name string
+	env_name := os.Getenv("GHB_CONFIG")
+	if env_name == "" {
+		config_file_name = filepath.Join(GetHomeDir(), `ghb.conf`)
+	} else {
+		config_file_name = env_name
+	}
+	content, err := ioutil.ReadFile(config_file_name)
+	if err == nil {
+		err = yaml.Unmarshal([]byte(content), &config)
+		if err != nil {
+			log.Fatalf("%s: %v", config_file_name, err)
+		}
+	} else if env_name == "" && errors.Is(err, os.ErrNotExist) {
+		// OK, default config is not required to exist
+	} else {
+		log.Panic(err)
+	}
+
+	// Provide missing defaults; resolve relative file names
+	if config.RootDir == "" {
+		config.RootDir = "GHB"
+	}
+	if !filepath.IsAbs(config.RootDir) {
+		config.RootDir = filepath.Join(GetHomeDir(), config.RootDir)
+	}
+
+	if config.RunnersDir == "" {
+		config.RunnersDir = `runners`
+	}
+	if !filepath.IsAbs(config.RunnersDir) {
+		config.RunnersDir = filepath.Join(config.RootDir, config.RunnersDir)
+	}
+
+	if config.CacheDir == "" {
+		config.CacheDir = `cache`
+	}
+	if !filepath.IsAbs(config.CacheDir) {
+		config.CacheDir = filepath.Join(config.RootDir, config.CacheDir)
+	}
+
+	if config.PiesConfigFile == "" {
+		config.PiesConfigFile = `pies.conf`
+	}
+	if !filepath.IsAbs(config.PiesConfigFile) {
+		config.PiesConfigFile = filepath.Join(config.RootDir, config.PiesConfigFile)
+	}
+}
+
+func FinalizeConfig() {
+	if err := CheckDir(config.RootDir); err != nil {
+		log.Panic(err)
+	}
+	if err := CheckDir(config.RunnersDir); err != nil {
+		log.Panic(err)
+	}
+	if err := CheckDir(config.CacheDir); err != nil {
+		log.Panic(err)
+	}
+
+	if _, err := os.Stat(config.PiesConfigFile); err == nil {
+		// File exists, Ok
+	} else if os.IsNotExist(err) {
+		if err := CreateFileFromStub(config.PiesConfigFile, PiesConfigStub); err != nil {
+			log.Panic(err)
+		}
+	} else {
+		log.Fatalf("can't stat %s: %v", config.PiesConfigFile, err)
+	}
+}
+
+func CreateFileFromStub(filename, stub string) error {
+	fmt.Printf("Creating file %s\n", filename)
+	tmpl, err := template.New("file").Funcs(template.FuncMap{
+		"Config": func () *Config { return &config },
+	}).Parse(stub)
+	if err != nil {
+		return fmt.Errorf("can't parse template: %v", err)
+	}
+
+	if file, err := os.Create(filename); err == nil {
+		err = tmpl.Execute(file, nil)
+		file.Close()
+		if err != nil {
+			return fmt.Errorf("can't write file %s: %v", filename, err)
+		}
+	} else {
+		return fmt.Errorf("can't create file %s: %v", filename, err)
+	}
+	return nil
 }
 
 func download(name string) error {
@@ -74,26 +216,7 @@ func download(name string) error {
 	return err
 }
 
-func GetArchiveFile() (filename string, e error) {
-	st, err := os.Stat(config.CacheDir)
-	switch {
-	case os.IsNotExist(err):
-		err := os.MkdirAll(config.CacheDir, 0750)
-		if err != nil {
-			e = fmt.Errorf("Can't cache dir %s: %v", config.CacheDir, err)
-			return
-		}
-	case err == nil:
-		if !st.IsDir() {
-			e = fmt.Errorf("%s exists, but is not a directory", config.CacheDir)
-			return
-		}
-
-	default:
-		e = fmt.Errorf("Can't stat %s: %v", config.CacheDir, err)
-		return
-	}
-
+func GetArchiveFile() (filename string, err error) {
 	filename = filepath.Join(config.CacheDir, filepath.Base(config.Url))
 	_, err = os.Stat(filename)
 	switch {
@@ -102,21 +225,21 @@ func GetArchiveFile() (filename string, e error) {
 		break
 	case os.IsNotExist(err):
 		fmt.Printf("Downloading %s\n", config.Url)
-		e = download(filename)
+		err = download(filename)
 	default:
-		e = fmt.Errorf("Can't stat %s: %v", filename, err)
+		err = fmt.Errorf("Can't stat %s: %v", filename, err)
 	}
 
 	return
 }
 
-func InstallToDir(projectName, projectUrl, projectToken string) error {
+func InstallToDir(projectName, projectUrl, projectToken, labels string) error {
 	arc, err := GetArchiveFile()
 	if err != nil {
 		return err
 	}
 
-	dirname := filepath.Join(config.RootDir, projectName)
+	dirname := filepath.Join(config.RunnersDir, projectName)
 	err = os.MkdirAll(dirname, 0750)
 	if err != nil {
 		return fmt.Errorf("Can't create %s: %v", dirname, err)
@@ -149,9 +272,19 @@ func InstallToDir(projectName, projectUrl, projectToken string) error {
 	}
 
 	name := hostname + `_` + projectName
-	
+
 	fmt.Printf("Configuring %s\n", name)
-	cmd = exec.Command("./config.sh", "--name", name, "--url", projectUrl, "--token", projectToken, "--unattended", "--replace")
+	cmdline := []string{
+		"--name", name,
+		"--url", projectUrl,
+		"--token", projectToken,
+		"--unattended", "--replace",
+	}
+	if labels != "" {
+		cmdline = append(cmdline, "--labels", labels)
+	}
+	cmd = exec.Command("./config.sh", cmdline...)
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -194,11 +327,20 @@ const (
 	eof = -1
 )
 
+type Locus struct {
+	File string
+	Line int
+	Column int
+}
+
+func (l Locus) String() string {
+	return fmt.Sprintf("%s:%d.%d", l.File, l.Line, l.Column)
+}
+
 type Token struct {
 	Type int
 	Text string
-	offset int
-	lineNo int
+	Start Locus
 }
 
 func (t *Token) EOF() bool {
@@ -227,8 +369,12 @@ func LexerNew(filename string) (*Lexer, error) {
 	return &Lexer{src: content, fileName: filename}, nil
 }
 
+func (l *Lexer) Locus() Locus {
+	return Locus{File: l.fileName, Line: l.lineNo + 1, Column: l.offset - l.lineOffset}
+}
+
 func (l *Lexer) Error(text string) error {
-	return fmt.Errorf("%s:%d.%d: %s", l.fileName, l.lineNo + 1, l.offset - l.lineOffset + 1, text)
+	return fmt.Errorf("%s: %s", l.Locus(), text)
 }
 
 func (l *Lexer) NextChar() (rune, error) {
@@ -268,8 +414,7 @@ func (l *Lexer) CurChar() (rune, error) {
 
 func (l *Lexer) scanWS() (token *Token, err error) {
 	var sb strings.Builder
-	offset := l.offset
-	lineNo := l.lineNo
+	locus := l.Locus()
 	for l.ch != eof && unicode.IsSpace(l.ch) {
 		sb.WriteRune(l.ch)
 		_, err = l.NextChar()
@@ -277,7 +422,7 @@ func (l *Lexer) scanWS() (token *Token, err error) {
 			return
 		}
 	}
-	token = &Token{Type: TokenWS, Text: sb.String(), offset: offset, lineNo: lineNo}
+	token = &Token{Type: TokenWS, Text: sb.String(), Start: locus}
 	return
 }
 
@@ -297,8 +442,7 @@ func IsWord(r rune) bool {
 
 func (l *Lexer) scanWord() (token *Token, err error) {
 	var sb strings.Builder
-	offset := l.offset
-	lineNo := l.lineNo
+	locus := l.Locus()
 	for IsWord(l.ch) {
 		sb.WriteRune(l.ch)
 		_, err = l.NextChar()
@@ -306,14 +450,13 @@ func (l *Lexer) scanWord() (token *Token, err error) {
 			return
 		}
 	}
-	token = &Token{Type: TokenWord, Text: sb.String(), offset: offset, lineNo: lineNo}
+	token = &Token{Type: TokenWord, Text: sb.String(), Start: locus}
 	return
 }
 
 func (l *Lexer) scanString() (token *Token, err error) {
 	var sb strings.Builder
-	offset := l.offset
-	lineNo := l.lineNo
+	locus := l.Locus()
 	for {
 		var r rune
 		r, err = l.NextChar()
@@ -359,23 +502,22 @@ func (l *Lexer) scanString() (token *Token, err error) {
 			default:
 				sb.WriteRune('\\')
 				sb.WriteRune(r)
-			}				
+			}
 		} else {
 			sb.WriteRune(l.ch)
 		}
 	}
 end:
- 	token = &Token{Type: TokenString, Text: sb.String(), offset: offset, lineNo: lineNo}
+	token = &Token{Type: TokenString, Text: sb.String(), Start: locus}
 	return
 }
-	
+
 func (l *Lexer) scanInlineComment(r rune) (token *Token, err error) {
 	var sb strings.Builder
 	if r != 0 {
 		sb.WriteRune(r)
 	}
-	offset := l.offset
-	lineNo := l.lineNo
+	locus := l.Locus()
 	for l.ch != eof && l.ch != '\n' {
 		sb.WriteRune(l.ch)
 		_, err = l.NextChar()
@@ -383,14 +525,13 @@ func (l *Lexer) scanInlineComment(r rune) (token *Token, err error) {
 			return
 		}
 	}
- 	token = &Token{Type: TokenComment, Text: sb.String(), offset: offset, lineNo: lineNo}
+	token = &Token{Type: TokenComment, Text: sb.String(), Start: locus}
 	return
 }
 
 func (l *Lexer) scanComment() (token *Token, err error) {
 	var sb strings.Builder
-	offset := l.offset
-	lineNo := l.lineNo
+	locus := l.Locus()
 	sb.WriteRune('/')
 	const (
 		StateIn = iota
@@ -420,7 +561,7 @@ func (l *Lexer) scanComment() (token *Token, err error) {
 			state = StateIn
 		}
 	}
- 	token = &Token{Type: TokenComment, Text: sb.String(), offset: offset, lineNo: lineNo}
+	token = &Token{Type: TokenComment, Text: sb.String(), Start: locus}
 	return
 }
 
@@ -434,15 +575,14 @@ func (l *Lexer) NextToken() (token *Token, err error) {
 
 	switch {
 	case r == eof:
-		token = &Token{Type: TokenEOF, offset: l.offset, lineNo: l.lineNo}
+		token = &Token{Type: TokenEOF, Start: l.Locus()}
 
 	case r == '#':
 		token, err = l.scanInlineComment(0)
 
 	case r == '/':
 		var r1 rune
-		offset := l.offset
-		lineNo := l.lineNo
+		locus := l.Locus()
 		r1, err = l.NextChar()
 		if err != nil {
 			return
@@ -452,14 +592,14 @@ func (l *Lexer) NextToken() (token *Token, err error) {
 		} else if r1 == '/' {
 			token, err = l.scanInlineComment('/')
 		} else {
-			token = &Token{Type: TokenPunct, Text: string(r), offset: offset, lineNo: lineNo}
+			token = &Token{Type: TokenPunct, Text: string(r), Start: locus}
 		}
 
 	case r == '"':
 		token, err = l.scanString()
-		
+
 	case unicode.IsPunct(r):
-		token = &Token{Type: TokenPunct, Text: string(r), offset: l.offset, lineNo: l.lineNo}
+		token = &Token{Type: TokenPunct, Text: string(r), Start: l.Locus()}
 		_, err = l.NextChar()
 
 	case unicode.IsSpace(r):
@@ -534,15 +674,21 @@ func (l *Lexer) SkipBlock() error {
 	}
 	return nil
 }
-		
+
 // ----------------------------------
 // Pies configuration file parser
 // ----------------------------------
 
+type Runner struct {
+	Num int
+	TokenStart int
+	TokenEnd int
+}
+
 type PiesConfig struct {
 	FileName string
 	ControlURL *url.URL
-	Runners map[string]int
+	Runners map[string][]Runner
 	Tokens []*Token
 }
 
@@ -572,7 +718,7 @@ func (pc *PiesConfig) ParseControl(l *Lexer) error {
 			pc.ControlURL, err = url.Parse(t.Text)
 			if err != nil {
 				// FIXME: locus (column)
-				log.Printf("%s:%d: can't parse URL: %v", l.fileName, t.lineNo + 1, err)
+				log.Printf("%s: can't parse URL: %v", t.Start, err)
 			}
 		}
 	}
@@ -596,6 +742,8 @@ func (pc *PiesConfig) Write(w io.Writer) (err error) {
 var runnerNameRx = regexp.MustCompile(`^(.+?)_(\d+)`)
 
 func (pc *PiesConfig) ParseComponent(l *Lexer) error {
+	start := len(l.tokens) - 1
+
 	t, err := l.NextNWSToken()
 	if err != nil {
 		return err
@@ -604,41 +752,45 @@ func (pc *PiesConfig) ParseComponent(l *Lexer) error {
 		return nil
 	}
 
+	runnerName := ""
+	r := Runner{TokenStart: start}
 	if t.IsText() {
 		m := runnerNameRx.FindStringSubmatch(t.Text)
 		if m != nil {
 			n, err := strconv.Atoi(m[2])
 			if err == nil {
-				if val, ok := pc.Runners[m[1]]; ok {
-					if val < n {
-						pc.Runners[m[1]] = n
-					}
-				} else {
-					pc.Runners[m[1]] = n
-				}
+				runnerName = m[1]
+				r.Num = n
 			}
 		}
 	}
-	return l.SkipStatement()
+	if err := l.SkipStatement(); err != nil {
+		return err
+	}
+	if runnerName != "" {
+		r.TokenEnd = len(l.tokens) - 1
+		pc.Runners[runnerName] = append(pc.Runners[runnerName], r)
+	}
+	return nil
 }
 
 func (pc *PiesConfig) Save() error {
 	tempfile, err := ioutil.TempFile(filepath.Dir(pc.FileName), filepath.Base(pc.FileName) + `.*`)
-        if err != nil {
-                return fmt.Errorf("can't create temporary file: %v", err)
-        }
+	if err != nil {
+		return fmt.Errorf("can't create temporary file: %v", err)
+	}
 	tempname := tempfile.Name()
 	err = pc.Write(tempfile)
 	if err != nil {
 		return err
-	}	
+	}
 	tempfile.Close()
 
 	err = os.Remove(pc.FileName)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("can't remove %s: %v", pc.FileName, err)
 	}
-	
+
 	err = os.Rename(tempname, pc.FileName)
 	if err != nil {
 		return fmt.Errorf("can't rename %s to %s: %v", tempname, pc.FileName, err)
@@ -648,8 +800,8 @@ func (pc *PiesConfig) Save() error {
 }
 
 func ParsePiesConfig(filename string) (*PiesConfig, error) {
-	pc := &PiesConfig{FileName: filename, Runners: make(map[string]int)}
-	
+	pc := &PiesConfig{FileName: filename, Runners: make(map[string][]Runner)}
+
 	l, err := LexerNew(filename)
 	if err != nil {
 		return nil, err
@@ -674,6 +826,9 @@ func ParsePiesConfig(filename string) (*PiesConfig, error) {
 			}
 		}
 	}
+	for p, _ := range pc.Runners {
+		sort.Slice(pc.Runners[p], func (i, j int) bool { return pc.Runners[p][i].Num < pc.Runners[p][j].Num })
+	}
 	pc.Tokens = l.tokens
 	return pc, nil
 }
@@ -686,13 +841,13 @@ func (pc *PiesConfig) AddRunner(name string) error {
 	pc.Tokens = append(pc.Tokens, &Token{Type: TokenWord, Text: text})
 	// l := &Lexer{src: []byte(text), fileName: "-"}
 	// for {
-	// 	t, err := l.NextToken()
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	if t.EOF() {
-	// 		break
-	// 	}
+	//	t, err := l.NextToken()
+	//	if err != nil {
+	//		return err
+	//	}
+	//	if t.EOF() {
+	//		break
+	//	}
 	// }
 	// pc.Tokens = append(pc.Tokens, l.tokens...)
 	return nil
@@ -708,6 +863,8 @@ type PiesReloadResponse struct {
 	//Parser_messages []string
 }
 
+var allIPRx = regexp.MustCompile(`^(0\.0\.0\.0)?(:.+)`)
+
 func PiesReloadConfig(controlURL *url.URL) error {
 	clt := http.Client{
 		Transport: &http.Transport{
@@ -716,7 +873,11 @@ func PiesReloadConfig(controlURL *url.URL) error {
 				case `local`, `file`, `unix`:
 					return net.Dial(`unix`, controlURL.Path)
 				case `inet`:
-					return net.Dial(`tcp`, controlURL.Host)
+					host := controlURL.Host
+					if m := allIPRx.FindStringSubmatch(host); m != nil {
+						host = `127.0.0.1` + m[2]
+					}
+					return net.Dial(`tcp`, host)
 				}
 				return nil, errors.New("Scheme not implemented")
 			},
@@ -736,7 +897,12 @@ func PiesReloadConfig(controlURL *url.URL) error {
 	}
 	resp, err := clt.Do(req)
 	if err != nil {
-		return fmt.Errorf("can't query: %v", err)
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			log.Printf("Pies not running?")
+			return nil
+		} else {
+			return fmt.Errorf("can't query: %v", err)
+		}
 	}
 
 	defer resp.Body.Close()
@@ -760,35 +926,119 @@ func PiesReloadConfig(controlURL *url.URL) error {
 	return nil
 }
 
+type Action struct {
+	Action func ([]string)
+	Help string
+}
 
-func main() {
-	log.SetPrefix(filepath.Base(os.Args[0]) + ": ")
-	log.SetFlags(log.Lmsgprefix)
+type Optset struct {
+	*getopt.Set
+	InitArgs []string
+	Command string
+	hflag bool
+}
 
-	getopt.SetProgram(filepath.Base(os.Args[0]))
-	getopt.SetParameters("[PROJECTNAME]")
+func NewOptset(args []string) (optset *Optset) {
+	optset = new(Optset)
+	optset.Set = getopt.New()
+	optset.InitArgs = args
+	optset.Command = filepath.Base(os.Args[0]) + " " + args[0]
+	optset.SetProgram(optset.Command)
+	optset.FlagLong(&optset.hflag, "help", 'h', "Show this help")
+	return
+}
+
+func (optset *Optset) Parse() {
+	if err := optset.Getopt(optset.InitArgs, nil); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		optset.PrintUsage(os.Stderr)
+		os.Exit(1)
+	}
+
+	if optset.hflag {
+		optset.PrintUsage(os.Stdout)
+		os.Exit(0)
+	}
+}
+
+var actions map[string]Action
+
+func HelpAction(args []string) {
+	commands := make([]string, len(actions))
+	i := 0
+	for com := range actions {
+		commands[i] = com
+		i++
+	}
+	sort.Strings(commands)
+	fmt.Printf("usage: %s COMMAND [ARGS...]\n", filepath.Base(os.Args[0]))
+	fmt.Printf("Available commands:\n")
+	for _, com := range commands {
+		fmt.Printf("    %-10s  %s\n", com, actions[com].Help)
+	}
+	fmt.Printf("To obtain a help on a particular command, run: %s COMMAND -h\n", filepath.Base(os.Args[0]))
+}
+
+func ListAction(args []string) {
+	optset := NewOptset(args)
+	optset.SetParameters("")
+	verbose := false
+	optset.FlagLong(&verbose, "verbose", 'v', "Verbosely list each runner location")
+	optset.Parse()
+
+	args = optset.Args()
+	if len(args) > 0 {
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	pc, err := ParsePiesConfig(config.PiesConfigFile)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	var projects []string
+	for p, _ := range pc.Runners {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		fmt.Printf("%-32.32s %4d %d\n", p, len(pc.Runners[p]), pc.Runners[p][len(pc.Runners[p])-1].Num + 1)
+		if verbose {
+			for _, r := range pc.Runners[p] {
+				fmt.Printf(" %d: %s - %s\n", r.Num, pc.Tokens[r.TokenStart].Start, pc.Tokens[r.TokenEnd].Start)
+			}
+		}
+	}
+}
+
+func AddAction(args []string) {
+	FinalizeConfig()
+	optset := NewOptset(args)
+	optset.SetParameters("[PROJECTNAME]")
 	var (
 		ProjectUrl string
 		ProjectToken string
 		ProjectName string
 	)
-	getopt.FlagLong(&ProjectUrl, "url", 0, "Project URL (mandatory)")
-	getopt.FlagLong(&ProjectToken, "token", 0, "Project token (mandatory)")
-	getopt.Parse()
+	optset.FlagLong(&ProjectUrl, "url", 0, "Project URL (mandatory)")
+	optset.FlagLong(&ProjectToken, "token", 0, "Project token (mandatory)")
+	labels := ""
+	optset.FlagLong(&labels, "labels", 'l', "Extra labels in addition to the default")
+	optset.Parse()
 
-	args := getopt.Args()
+	args = optset.Args()
 	switch len(args) {
 	case 0:
 		// ok
 	case 1:
 		ProjectName = args[0]
 	default:
-		log.Fatalf("too many arguments; try `%s help' for assistance", filepath.Base(os.Args[0]))
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
 	}
 
 	pc, err := ParsePiesConfig(config.PiesConfigFile)
 	if err != nil {
-		panic(err)//FIXME
+		log.Panic(err)
 	}
 
 	if ProjectUrl == "" || ProjectToken == "" {
@@ -799,30 +1049,149 @@ func main() {
 		ProjectName = filepath.Base(ProjectUrl)
 	}
 
-	n, ok := pc.Runners[ProjectName]
+	n := 0
+	r, ok := pc.Runners[ProjectName]
 	if ok {
-		n += 1
-	} else {
-		n = 0
+		n = r[len(r)-1].Num + 1
 	}
 
 	name := ProjectName + `_` + strconv.Itoa(n)
 	// FIXME: check if dirname exists
 
-	if err := InstallToDir(name, ProjectUrl, ProjectToken); err != nil {
-		panic(err)
+	if err := InstallToDir(name, ProjectUrl, ProjectToken, labels); err != nil {
+		log.Fatal(err)
 	}
 
 	if err := pc.AddRunner(name); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	
+
 	if err := pc.Save(); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	if err := PiesReloadConfig(pc.ControlURL); err != nil {
-		panic(err)
+		log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
 	}
-	os.Exit(0)
+}
+
+func DeleteAction(args []string) {
+	FinalizeConfig()
+	optset := NewOptset(args)
+	optset.SetParameters("PROJECTNAME [NUMBER]")
+	optset.Parse()
+
+	args = optset.Args()
+	var (
+		projectName string
+		runnerNum int
+	)
+	switch len(args) {
+	case 2:
+		projectName = args[0]
+		n, err := strconv.Atoi(args[1])
+		if err != nil {
+			log.Fatalf("bad runner number: %s", args[1])
+		}
+		runnerNum = n
+
+	case 1:
+		m := runnerNameRx.FindStringSubmatch(args[0])
+		if m != nil {
+			if n, err := strconv.Atoi(m[2]); err == nil {
+				projectName = m[1]
+				runnerNum = n
+			} else {
+				log.Fatalf("bad runner number: %s", m[2])
+			}
+		} else {
+			log.Fatalf("unsupported runner name: %s", args[0])
+		}
+
+	default:
+		log.Fatalf("wrong number of arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	pc, err := ParsePiesConfig(config.PiesConfigFile)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	r, ok := pc.Runners[projectName]
+	if !ok {
+		log.Fatalf("found no runners for %s", projectName)
+	}
+
+	i := sort.Search(len(r), func(i int) bool { return r[i].Num >= runnerNum })
+	if i < len(r) && r[i].Num == runnerNum {
+		pc.Tokens = append(pc.Tokens[:r[i].TokenStart], pc.Tokens[r[i].TokenEnd+1:]...)
+		if err := pc.Save(); err != nil {
+			log.Fatal(err)
+		}
+		if err := PiesReloadConfig(pc.ControlURL); err != nil {
+			log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
+		}
+		// FIXME: run ./config.sh remove --token T
+	} else {
+		log.Fatalf("%s: no runner %d", projectName, runnerNum)
+	}
+}
+
+func CheckConfigAction(args []string) {
+	optset := NewOptset(args)
+	optset.SetParameters("")
+	finalize := false
+	optset.FlagLong(&finalize, "finalize", 'f', "Finalize the configuration")
+	optset.Parse()
+
+	if len(optset.Args()) != 0 {
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	yml, err := yaml.Marshal(&config)
+	if err != nil {
+		log.Panic(err)
+	}
+	fmt.Println(string(yml))
+
+	if finalize {
+		FinalizeConfig()
+	}
+}
+
+func main() {
+	log.SetPrefix(filepath.Base(os.Args[0]) + ": ")
+	log.SetFlags(log.Lmsgprefix)
+
+	ReadConfig()
+
+	getopt.SetProgram(filepath.Base(os.Args[0]))
+	getopt.SetParameters("COMMAND [OPTIONS]")
+	getopt.Parse()
+
+	args := getopt.Args()
+
+	actions = map[string]Action{
+		"add":     Action{Action: AddAction,
+				  Help: "Add runner"},
+		"delete":  Action{Action: DeleteAction,
+				  Help: "Delete a runner"},
+		"list":    Action{Action: ListAction,
+				  Help: "List existing runners"},
+		"check":   Action{Action: CheckConfigAction,
+				  Help: "Check current configuration"},
+		"help":    Action{Action: HelpAction,
+				  Help: "Show a short help summary"},
+	}
+
+	if len(os.Args) == 1 {
+		log.Fatalf("command missing; try `%s help' for assistance", filepath.Base(os.Args[0]))
+	}
+
+	if act, ok := actions[args[0]]; ok {
+		act.Action(args)
+		os.Exit(0)
+	}
+
+	log.Fatalf("unrecognized action; try `%s help' for assistance", filepath.Base(os.Args[0]))
 }
