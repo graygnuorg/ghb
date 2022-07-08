@@ -25,22 +25,27 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"time"
 	"text/template"
 	"context"
 	"sort"
+	"reflect"
+	"golang.org/x/mod/semver"
 	"github.com/pborman/getopt/v2"
 	"gopkg.in/yaml.v2"
-	"github.com/graygnuorg/go-gdbm"
 )
 
 type Config struct {
-	Url string                `yaml:"url"`
-	RootDir string            `yaml:"root_dir"`
-	RunnersDir string         `yaml:"runners_dir"`
-	CacheDir string           `yaml:"cache_dir"`
-	Tar string                `yaml:"tar"`
-	PiesConfigFile string     `yaml:"pies_config_file"`
-	ComponentTemplate string  `yaml:"component_template"`
+	Url string                `yaml:"url" rem:"URL of the runner application tarball"`
+	UserName string           `yaml:"user_name" rem:"Your GitHub user name"`
+	PAT string                `yaml:"pat" rem:"Personal Access Token (https://github.com/settings/tokens)"`
+	RootDir string            `yaml:"root_dir" rem:"Root directory" verify:"dir_exist"`
+	RunnersDir string         `yaml:"runners_dir" rem:"Directory for storing runners" verify:"dir_exist"  rel:"RootDir"`
+	CacheDir string           `yaml:"cache_dir" rem:"Cache directory" verify:"dir_exist" rel:"RootDir"`
+	Tar string                `yaml:"tar" rem:"Tar binary" verify:"exe"`
+	Pies string               `yaml:"pies" rem:"Pies binary" verify:"pies_version"`
+	PiesConfigFile string     `yaml:"pies_config_file" rem:"Pies configuration file name" verify:"pies_config" rel:"RootDir"`
+	ComponentTemplate string  `yaml:"component_template" rem:"Template for runner components" verify:"component_template"`
 }
 
 var config = Config{
@@ -48,14 +53,17 @@ var config = Config{
 	RunnersDir: ``,
 	CacheDir: ``,
 	Tar: `tar`,
+	Pies: `pies`,
 	PiesConfigFile: ``,
-	ComponentTemplate: `component {{ RunnerName }} {
-	mode respawn;
-	chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
-	stderr syslog daemon.err;
-	stdout syslog daemon.info;
-	flags siggroup;
-	command "./run.sh";
+	// FIXME: Make sure the lines in the literal below are indented using spaces, not tabs.
+	// This way yaml marshaller prints the value in readable form.
+        ComponentTemplate: `component {{ RunnerName }} {
+        mode respawn;
+        chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
+        stderr syslog daemon.err;
+        stdout syslog daemon.info;
+        flags siggroup;
+        command "./run.sh";
 }
 `,
 }
@@ -99,22 +107,23 @@ func CheckDir(dirname string) error {
 	return nil
 }
 
-func ReadConfig() {
-	var config_file_name string
+func ReadConfig() (ok bool, filename string) {
 	env_name := os.Getenv("GHB_CONFIG")
 	if env_name == "" {
-		config_file_name = filepath.Join(GetHomeDir(), `ghb.conf`)
+		filename = filepath.Join(GetHomeDir(), `ghb.conf`)
 	} else {
-		config_file_name = env_name
+		filename = env_name
 	}
-	content, err := ioutil.ReadFile(config_file_name)
+	content, err := ioutil.ReadFile(filename)
 	if err == nil {
 		err = yaml.Unmarshal([]byte(content), &config)
 		if err != nil {
-			log.Fatalf("%s: %v", config_file_name, err)
+			log.Fatalf("%s: %v", filename, err)
 		}
+		ok = true
 	} else if env_name == "" && errors.Is(err, os.ErrNotExist) {
 		// OK, default config is not required to exist
+		ok = false
 	} else {
 		log.Panic(err)
 	}
@@ -147,6 +156,100 @@ func ReadConfig() {
 	if !filepath.IsAbs(config.PiesConfigFile) {
 		config.PiesConfigFile = filepath.Join(config.RootDir, config.PiesConfigFile)
 	}
+	return
+}
+
+func VerifyStruct(obj interface{}, verbose bool) (result bool) {
+	result = true
+
+	verifier := map[string]func(reflect.Value) error {
+		"dir_exist": func(v reflect.Value) error {
+			dirname, _ := v.Interface().(string)
+			st, err := os.Stat(dirname)
+			if err == nil {
+				if !st.IsDir() {
+					err = fmt.Errorf("%s exists, but is not a directory", dirname)
+				}
+			}
+			return err
+		},
+		"exe": func(v reflect.Value) error {
+			exe, _ := v.Interface().(string)
+			cmd := exec.Command(exe, "--version")
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			return cmd.Run()
+		},
+		"pies_version": func(v reflect.Value) error {
+			exe, _ := v.Interface().(string)
+			return CheckPiesCommand(exe)
+		},
+		"pies_config": func(v reflect.Value) error {
+			filename, _ := v.Interface().(string)
+			if _, err := os.Stat(filename); err != nil {
+				return err
+			}
+			cmd := exec.Command(config.Pies, "--config-file", filename, "--lint")
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			if err := cmd.Run(); err != nil {
+				if werr, ok := err.(*exec.ExitError); ok {
+					if s := werr.Error(); s == "78" {
+						return errors.New("syntax check failed")
+					}
+				}
+				return err
+			}
+			return nil
+		},
+		"component_template": func(v reflect.Value) error {
+			text, _ := v.Interface().(string)
+			_, err := ExpandTemplate(text, "runner_0");
+			return err
+		},
+	}
+
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		log.Printf("Passed object has unsupported type: %s", v.Kind())
+		return false
+	}
+	t := v.Type()
+
+	if verbose {
+		fmt.Println("Verifying configuration")
+	}
+
+	for i := 0; i < v.NumField(); i++ {
+		f := t.Field(i)
+		name := f.Tag.Get(`yaml`)
+		if name == "" {
+			continue
+		}
+		vt := f.Tag.Get(`verify`)
+		if vt == "" {
+			continue
+		}
+
+		if ckf, ok := verifier[vt]; ok {
+			if verbose {
+				fmt.Printf("  %s = %#v: ",name, v.Field(i))
+			}
+			if err := ckf(v.Field(i)); err != nil {
+				if verbose {
+					fmt.Println(err)
+				}
+
+				result = false
+			} else if verbose {
+				fmt.Println("OK")
+			}
+		}
+	}
+	return
 }
 
 func FinalizeConfig() {
@@ -278,7 +381,7 @@ func InstallToDir(projectName, projectUrl, projectToken, labels string) error {
 		"--name", name,
 		"--url", projectUrl,
 		"--token", projectToken,
-		"--unattended", "--replace",
+		"--unattended",
 	}
 	if labels != "" {
 		cmdline = append(cmdline, "--labels", labels)
@@ -295,11 +398,11 @@ func InstallToDir(projectName, projectUrl, projectToken, labels string) error {
 	return nil
 }
 
-func ExpandTemplate(runnerName string) (string, error) {
+func ExpandTemplate(text, runnerName string) (string, error) {
 	tmpl, err := template.New("component").Funcs(template.FuncMap{
 		"RunnerName": func () string { return runnerName },
 		"Config": func () *Config { return &config },
-	}).Parse(config.ComponentTemplate)
+	}).Parse(text)
 	if err != nil {
 		return "", err
 	}
@@ -852,7 +955,7 @@ func ParsePiesConfig(filename string) (*PiesConfig, error) {
 }
 
 func (pc *PiesConfig) AddRunner(name string) error {
-	text, err := ExpandTemplate(name)
+	text, err := ExpandTemplate(config.ComponentTemplate, name)
 	if err != nil {
 		return err
 	}
@@ -875,7 +978,7 @@ func (pc *PiesConfig) AddRunner(name string) error {
 // Pies CTL API
 // ----------------------------------
 
-type PiesReloadResponse struct {
+type PiesResponse struct {
 	Status string
 	Message string
 	//Parser_messages []string
@@ -883,7 +986,7 @@ type PiesReloadResponse struct {
 
 var allIPRx = regexp.MustCompile(`^(0\.0\.0\.0)?(:.+)`)
 
-func PiesReloadConfig(controlURL *url.URL) error {
+func PiesClient(controlURL *url.URL, method, path string, retval interface{}) (reterr error) {
 	clt := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
@@ -902,86 +1005,108 @@ func PiesReloadConfig(controlURL *url.URL) error {
 		},
 	}
 
-	rurl := &url.URL{Scheme: "http", Path: `/conf/runtime`}
+	rurl := &url.URL{Scheme: "http", Path: path}
 	if controlURL.Scheme == "inet" {
 		rurl.Host = controlURL.Host
 	} else {
 		rurl.Host = "localhost"
 	}
 
-	req, err := http.NewRequest(http.MethodPut, rurl.String(), nil)
+	req, err := http.NewRequest(method, rurl.String(), nil)
 	if err != nil {
-		return fmt.Errorf("can't create HTTP request: %v", err)
+		reterr  = err
+		return
 	}
 	resp, err := clt.Do(req)
 	if err != nil {
 		if errors.Is(err, syscall.ECONNREFUSED) {
-			log.Printf("Pies not running?")
-			return nil
+			reterr = fmt.Errorf("can't connect to pies: not running?")
 		} else {
-			return fmt.Errorf("can't query: %v", err)
+			reterr = fmt.Errorf("can't query: %v", err)
 		}
+		return
 	}
 
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("can't read response: %v", err)
+		reterr = fmt.Errorf("can't read response: %v", err)
+		return
 	}
 
-	var rresp PiesReloadResponse
-	err = json.Unmarshal(body, &rresp)
-	if err != nil {
-		return fmt.Errorf("can't parse response %s: %v", string(body), err)
+	if retval != nil {
+		reterr = json.Unmarshal(body, retval)
 	}
+	return
+}
 
-	if rresp.Status == "OK" {
-		fmt.Println("Pies reload successful")
-	} else {
-		return fmt.Errorf("Pies reload failed: %s %s", rresp.Status, rresp.Message)
+func PiesStopInstance(controlURL *url.URL) error {
+	var resp PiesResponse
+	if err := PiesClient(controlURL, http.MethodDelete, `/instance/PID`, &resp); err != nil {
+		return err
+	}
+	if resp.Status != "OK" {
+		return errors.New(resp.Message)
 	}
 
 	return nil
 }
 
-func SaveToken(name, token string) error {
-	dbname := filepath.Join(config.CacheDir, `token.db`)
-	db, err := gdbm.Open(dbname, gdbm.ModeWrcreat)
-	if err != nil {
-		return fmt.Errorf("can't open database file %s for update: %v", dbname, err)
+func PiesRestartInstance(controlURL *url.URL) error {
+	var resp PiesResponse
+	if err := PiesClient(controlURL, http.MethodPut, `/instance/PID`, &resp); err != nil {
+		return err
 	}
-	defer db.Close()
-	if err := db.Store([]byte(name), []byte(token), true); err != nil {
-		return fmt.Errorf("can't store key %s: %v", name, err)
+	if resp.Status != "OK" {
+		return errors.New(resp.Message)
+	}
+
+	return nil
+}
+
+func PiesReloadConfig(controlURL *url.URL) error {
+	var rresp PiesResponse
+	err := PiesClient(controlURL, http.MethodPut, `/conf/runtime`, &rresp)
+	if err != nil {
+		return err
+	}
+
+	if rresp.Status != "OK" {
+		return errors.New(rresp.Message)
 	}
 	return nil
 }
 
-func FetchToken(name string) (string, error) {
-	dbname := filepath.Join(config.CacheDir, `token.db`)
-	db, err := gdbm.Open(dbname, gdbm.ModeReader)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			err = gdbm.ErrItemNotFound
-		}
-		return "", err
-	}
-	defer db.Close()
-	if ret, err := db.Fetch([]byte(name)); err == nil {
-		return string(ret), nil
-	} else {
-		return "", err
-	}
+type PiesInstanceInfo struct {
+	PID int             `json:"PID"`
+	Args []string       `json:"argv"`
+	Binary string       `json:"binary"`
+	InstanceName string `json:"instance"`
+	PackageName string  `json:"package"`
+	Version string      `json:"version"`
 }
 
-func DeleteToken(name string) error {
-	dbname := filepath.Join(config.CacheDir, `token.db`)
-	db, err := gdbm.Open(dbname, gdbm.ModeWrcreat)
-	if err != nil {
-		return fmt.Errorf("can't open database file %s for update: %v", dbname, err)
-	}
-	defer db.Close()
-	return db.Delete([]byte(name))
+func GetPiesInstanceInfo(controlURL *url.URL) (err error, info PiesInstanceInfo) {
+	err = PiesClient(controlURL, http.MethodGet, `/instance`, &info)
+	return
+}
+
+type PiesComponentInfo struct {
+	Mode string         `json:"mode"`
+	Status string       `json:"status"`
+	PID int             `json:"PID"`
+	URL string          `json:"URL"`
+	Service string      `json:"service"`
+	TcpMUXMaster string `json:"master"`
+	Runlevels string    `json:"runlevels"`
+	WakeupTime int      `json:"wakeup-time"`
+	Args []string       `json:"argv"`
+	Command string      `json:"command"`
+}
+
+func GetPiesComponentInfo(controlURL *url.URL) (err error, info []PiesComponentInfo) {
+	err = PiesClient(controlURL, http.MethodGet, `/programs`, &info)
+	return
 }
 
 type Action struct {
@@ -1038,6 +1163,8 @@ func HelpAction(args []string) {
 }
 
 func ListAction(args []string) {
+	ReadConfig()
+
 	optset := NewOptset(args)
 	optset.SetParameters("")
 	verbose := false
@@ -1070,41 +1197,36 @@ func ListAction(args []string) {
 }
 
 func AddAction(args []string) {
+	ReadConfig()
 	FinalizeConfig()
 	optset := NewOptset(args)
-	optset.SetParameters("[PROJECTNAME]")
-	var (
-		ProjectUrl string
-		ProjectToken string
-		ProjectName string
-	)
-	optset.FlagLong(&ProjectUrl, "url", 0, "Project URL (mandatory)")
-	optset.FlagLong(&ProjectToken, "token", 0, "Project token (mandatory)")
+	optset.SetParameters("PROJECTNAME")
+	optset.FlagLong(&config.UserName, "user", 0, "GitHub user name", "NAME")
+	optset.FlagLong(&config.PAT, "pat", 0, "Private authentication token", "STRING")
 	labels := ""
-	optset.FlagLong(&labels, "labels", 'l', "Extra labels in addition to the default")
+	optset.FlagLong(&labels, "labels", 'l', "Extra labels in addition to the default", "STRING")
 	optset.Parse()
 
 	args = optset.Args()
-	switch len(args) {
-	case 0:
-		// ok
-	case 1:
-		ProjectName = args[0]
-	default:
-		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	if len(args) != 1 {
+		log.Fatalf("bad number of arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	ProjectName := args[0]
+	ProjectUrl := `https://github.com/` + config.UserName + `/` + ProjectName
+
+	ProjectToken := GetGitHubToken(RegistrationToken, ProjectName)
+	if ProjectToken == "" {
+		log.Println("Can't obtain a token for adding:")
+		log.Println(`Make sure sure your configuration file sets your GitHub user name (UserName:)
+and authorization token (PAT).  You can also supply these manually, using
+the --user and  --pat command line options.`)
+		os.Exit(1)
 	}
 
 	pc, err := ParsePiesConfig(config.PiesConfigFile)
 	if err != nil {
 		log.Panic(err)
-	}
-
-	if ProjectUrl == "" || ProjectToken == "" {
-		log.Fatal("both --url and --token are mandatory")
-	}
-
-	if ProjectName == "" {
-		ProjectName = filepath.Base(ProjectUrl)
 	}
 
 	n := 0
@@ -1115,11 +1237,6 @@ func AddAction(args []string) {
 
 	name := ProjectName + `_` + strconv.Itoa(n)
 	// FIXME: check if dirname exists
-
-	if err := SaveToken(name, ProjectToken); err != nil {
-		log.Printf("failed to save token for %s: %v", name, err)
-		log.Printf("continuing anyway")
-	}
 
 	if err := InstallToDir(name, ProjectUrl, ProjectToken, labels); err != nil {
 		log.Fatal(err)
@@ -1138,24 +1255,15 @@ func AddAction(args []string) {
 	}
 }
 
-func RemoveRunner(name, dirname string) {
-	token, err := FetchToken(name)
-	if err != nil {
-		log.Printf("can't find token for %s: %v", name, err)
-		log.Printf("directory %s left in place")
-		return
-	}
-
+func RemoveRunner(name, dirname, token string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
-		log.Printf("Can't get cwd: %v", err)
-		return
+		return fmt.Errorf("can't get cwd: %v", err)
 	}
 	defer os.Chdir(cwd)
 
-	err = os.Chdir(dirname)
-	if err != nil {
-		log.Printf("can't chdir to %s: %v", dirname, err)
+	if err := os.Chdir(dirname); err != nil {
+		return fmt.Errorf("can't chdir to %s: %v", dirname, err)
 	}
 
 	cmd := exec.Command("./config.sh", "remove", "--token", token)
@@ -1164,29 +1272,103 @@ func RemoveRunner(name, dirname string) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		log.Printf("Error removing %s: %v", name, err)
-		return
+		return fmt.Errorf("Error removing %s: %v", name, err)
 	}
 
-	err = os.Chdir(cwd)
+	if err := os.Chdir(cwd); err != nil {
+		return fmt.Errorf("can't chdir to %s: %v", cwd, err)
+	}
+
+	if err := os.RemoveAll(dirname); err != nil {
+		return fmt.Errorf("failed to remove %s: %v", dirname, err)
+	}
+	return nil
+}
+
+const (
+	RemoveToken = `remove-token`
+	RegistrationToken = `registration-token`
+)
+
+type GHToken struct {
+	Token string         `json:"token"`
+	ExpiresAt time.Time  `json:"expires_at"`
+}
+
+func ReadCachedToken(kind string) (string, error) {
+	filename := filepath.Join(config.CacheDir, `.` + kind)
+	content, err := ioutil.ReadFile(filename)
 	if err != nil {
-		log.Printf("can't chdir to %s: %v", cwd, err)
+		return "", err
+	}
+	var tok GHToken
+	if err := json.Unmarshal([]byte(content), &tok); err != nil {
+		return "", err
 	}
 
-	if err = DeleteToken(name); err != nil {
-		log.Printf("failed to delete token for %s: %v", name, err)
+	if time.Now().Before(tok.ExpiresAt) {
+		return tok.Token, nil
 	}
 
-	err = os.RemoveAll(dirname)
+	return "", os.ErrNotExist
+}
+
+func ObtainGitHubToken(kind, project string) (string, error) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.github.com/repos/" + config.UserName + "/" + project + "/actions/runners/" + kind, nil)
 	if err != nil {
-		log.Printf("failed to remove %s: %v", dirname, err)
+		return "", err
 	}
+
+	req.Header.Add("Accept", "application/vnd.github+json")
+	req.Header.Add("Authorization", "token " + config.PAT)
+	fmt.Printf("Getting %s token for %s\n", kind, req.URL.String())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var tok GHToken
+	if body, err := ioutil.ReadAll(resp.Body); err == nil {
+		if err := json.Unmarshal(body, &tok); err != nil {
+			return "", err
+		}
+		ioutil.WriteFile(filepath.Join(config.CacheDir, `.` + kind), body, 0640)
+	} else {
+		return "", err
+	}
+	return tok.Token, nil
+}
+
+func GetGitHubToken(kind, projectName string) string {
+	if t, err := ReadCachedToken(kind); err == nil {
+		return t
+	} else {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Println(err)
+		}
+		if config.UserName != "" && config.PAT != "" {
+			if t, err := ObtainGitHubToken(kind, projectName); err == nil {
+				return t
+			} else {
+				log.Println(err)
+			}
+		}
+	}
+	return ""
 }
 
 func DeleteAction(args []string) {
+	ReadConfig()
 	FinalizeConfig()
 	optset := NewOptset(args)
 	optset.SetParameters("PROJECTNAME [NUMBER]")
+	keep := false
+	optset.FlagLong(&keep, "keep", 'k', "Keep the configured runner directory")
+	force := false
+	optset.FlagLong(&force, "force", 'f', "Force removal of the runner directory")
+	optset.FlagLong(&config.UserName, "user", 0, "GitHub user name", "NAME")
+	optset.FlagLong(&config.PAT, "pat", 0, "Private authentication token", "STRING")
 	optset.Parse()
 
 	args = optset.Args()
@@ -1204,20 +1386,32 @@ func DeleteAction(args []string) {
 		runnerNum = n
 
 	case 1:
-		m := runnerNameRx.FindStringSubmatch(args[0])
-		if m != nil {
-			if n, err := strconv.Atoi(m[2]); err == nil {
-				projectName = m[1]
-				runnerNum = n
-			} else {
-				log.Fatalf("bad runner number: %s", m[2])
-			}
-		} else {
-			log.Fatalf("unsupported runner name: %s", args[0])
-		}
+		projectName = args[0]
+		runnerNum = -1	// remove last
 
 	default:
 		log.Fatalf("wrong number of arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	if force && keep {
+		log.Fatal("--force and --keep can't be used together")
+	}
+
+	rem_token := ""
+	if !keep {
+		rem_token = GetGitHubToken(RemoveToken, projectName)
+		if rem_token == "" && !force {
+			log.Println("Can't obtain a token for removal:")
+			log.Println(`Make sure sure your configuration file sets your GitHub user name (UserName:)
+and authorization token (PAT).  You can also supply these manually, using
+the --user and  --pat command line options.
+
+To remove the runner without deregistering it from GitHub, use the --force
+option.
+
+To remove the runner keeping its directory intact, use the --keep option.`)
+			os.Exit(1)
+		}
 	}
 
 	pc, err := ParsePiesConfig(config.PiesConfigFile)
@@ -1230,49 +1424,345 @@ func DeleteAction(args []string) {
 		log.Fatalf("found no runners for %s", projectName)
 	}
 
-	i := sort.Search(len(r), func(i int) bool { return r[i].Num >= runnerNum })
-	if i < len(r) && r[i].Num == runnerNum {
-		pc.Tokens = append(pc.Tokens[:r[i].TokenStart], pc.Tokens[r[i].TokenEnd+1:]...)
-		if err := pc.Save(); err != nil {
-			log.Fatal(err)
-		}
-		if err := PiesReloadConfig(pc.ControlURL); err != nil {
-			log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
-		}
+	var i int
 
-		RemoveRunner(projectName + `_` + strconv.Itoa(runnerNum), r[i].Dir)
+	if runnerNum == -1 {
+		i = len(r) - 1
+		runnerNum = r[i].Num
+		fmt.Printf("Removing runner %s_%d\n", projectName, runnerNum)
 	} else {
-		log.Fatalf("%s: no runner %d", projectName, runnerNum)
+		i = sort.Search(len(r), func(i int) bool { return r[i].Num >= runnerNum })
+		if !(i < len(r) && r[i].Num == runnerNum) {
+			log.Fatalf("%s: no runner %d", projectName, runnerNum)
+		}
 	}
+
+	if rem_token != "" {
+		if err := RemoveRunner(projectName + `_` + strconv.Itoa(runnerNum), r[i].Dir, rem_token); err != nil {
+			log.Printf("failed to remove runner: %v", err)
+			if force {
+				log.Printf("continuing anyway")
+			}
+			os.Exit(1)
+		}
+	}
+
+	pc.Tokens = append(pc.Tokens[:r[i].TokenStart], pc.Tokens[r[i].TokenEnd+1:]...)
+	if err := pc.Save(); err != nil {
+		log.Fatal(err)
+	}
+	if err := PiesReloadConfig(pc.ControlURL); err != nil {
+		log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
+	}
+
 }
 
 func CheckConfigAction(args []string) {
 	optset := NewOptset(args)
 	optset.SetParameters("")
-	finalize := false
-	optset.FlagLong(&finalize, "finalize", 'f', "Finalize the configuration")
+	list := false
+	optset.FlagLong(&list, "list", 'l', "Show the configuration")
 	optset.Parse()
 
 	if len(optset.Args()) != 0 {
 		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
 	}
 
-	yml, err := yaml.Marshal(&config)
+	if ok, filename := ReadConfig(); ok {
+		fmt.Printf("Using configuration file %s\n", filename)
+	} else {
+		fmt.Println("Using built-in configuration defaults")
+	}
+
+	if list {
+		Annotate(&config, os.Stdout)
+		// yml, err := yaml.Marshal(&config)
+		// if err != nil {
+		//	log.Panic(err)
+		// }
+		// fmt.Println(string(yml))
+	}
+
+	if ! VerifyStruct(&config, true) {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func StatusAction(args []string) {
+	optset := NewOptset(args)
+	optset.SetParameters("")
+	verbose := false
+	optset.FlagLong(&verbose, "verbose", 'v', "Increase verbosity")
+	optset.Parse()
+
+	if len(optset.Args()) != 0 {
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	if ok, filename := ReadConfig(); ok {
+		fmt.Printf("Using configuration file %s\n", filename)
+	} else {
+		fmt.Println("Using built-in configuration defaults")
+	}
+
+	if VerifyStruct(&config, verbose) {
+		fmt.Println("Configuration file passed syntax check")
+	} else {
+		os.Exit(1)
+	}
+
+	pc, err := ParsePiesConfig(config.PiesConfigFile)
 	if err != nil {
 		log.Panic(err)
 	}
-	fmt.Println(string(yml))
 
-	if finalize {
-		FinalizeConfig()
+	if err, info := GetPiesInstanceInfo(pc.ControlURL); err == nil {
+		fmt.Printf("%s %s running with PID %d\n", info.PackageName, info.Version, info.PID)
+	} else {
+		fmt.Println(err)
 	}
+
+	if err, info := GetPiesComponentInfo(pc.ControlURL); err == nil {
+		if n := len(info); n == 0 {
+			fmt.Println("No runners active")
+		} else {
+			fmt.Printf("%d runners active\n", n)
+		}
+	}
+}
+
+func PiesStart() {
+	fmt.Println("Starting GNU pies")
+	cmd := exec.Command(config.Pies, "--config-file", config.PiesConfigFile)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Can't start %s: %v", config.Pies, err)
+	}
+}
+
+func StartAction(args []string) {
+	optset := NewOptset(args)
+	optset.SetParameters("")
+	optset.Parse()
+
+	if len(optset.Args()) != 0 {
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	ReadConfig()
+
+	if ! VerifyStruct(&config, false) {
+		log.Fatalf("configuration fails sanity checking; run `%s configcheck' for more info", os.Args[0])
+	}
+
+	if pc, err := ParsePiesConfig(config.PiesConfigFile); err == nil {
+		if err, _ := GetPiesInstanceInfo(pc.ControlURL); err == nil {
+			log.Fatalf("GNU pies supervisor is running; run `%s status` for more info", os.Args[0])
+		}
+	} else {
+		log.Fatal(err)
+	}
+
+	PiesStart()
+}
+
+func StopAction(args []string) {
+	optset := NewOptset(args)
+	optset.SetParameters("")
+	optset.Parse()
+
+	if len(optset.Args()) != 0 {
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	ReadConfig()
+	pc, err := ParsePiesConfig(config.PiesConfigFile)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	if err, _ := GetPiesInstanceInfo(pc.ControlURL); err != nil {
+		log.Fatal("No running pies instance found")
+	}
+
+	if err := PiesStopInstance(pc.ControlURL); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("GNU pies stopped")
+}
+
+func RestartAction(args []string) {
+	optset := NewOptset(args)
+	optset.SetParameters("")
+	optset.Parse()
+
+	if len(optset.Args()) != 0 {
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
+	ReadConfig()
+	pc, err := ParsePiesConfig(config.PiesConfigFile)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	if err, _ := GetPiesInstanceInfo(pc.ControlURL); err == nil {
+		if err := PiesStopInstance(pc.ControlURL); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("GNU pies restarted")
+	} else {
+		PiesStart()
+	}
+}
+
+var (
+	PiesVersionRx = regexp.MustCompile(`^pies\s+\(GNU Pies\)\s+(\d+(:?\.\d+){1,2})(\S+)?`)
+	PiesVersionMin = `1.7.92`
+)
+
+func CheckPiesCommand(exe string) error {
+	out, err := exec.Command(exe, "--version").Output()
+	if err != nil {
+		return err
+	}
+
+	if m := PiesVersionRx.FindStringSubmatch(string(out)); m != nil {
+		if semver.Compare(semver.Canonical(`v`+m[1]), semver.Canonical(`v`+PiesVersionMin)) < 0 {
+			return fmt.Errorf("version too old: %s", m[1])
+		}
+	} else {
+		return errors.New("can't determine GNU pies version")
+	}
+	return nil
+}
+
+func findStringPrefix(a []string, p string) int {
+	p += `:`
+	for i, s := range a {
+		if strings.HasPrefix(s, p) {
+			return i
+		}
+	}
+	return -1
+}
+
+func NormalizeRel(obj interface{}) {
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		log.Panic("Passed object has unsupported type: %s", v.Kind())
+	}
+	t := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		f := t.Field(i)
+		relname := f.Tag.Get(`rel`)
+		if relname != "" {
+			if relv := v.FieldByName(relname); !relv.IsZero() {
+				basepath := relv.Interface().(string)
+				path := v.Field(i).Interface().(string)
+				if s, err := filepath.Rel(basepath, path); err == nil {
+					v.Field(i).SetString(s)
+				}
+			}
+		}
+	}
+}
+
+func Annotate(obj interface{}, wr io.Writer) error {
+	b, err := yaml.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	astr := strings.Split(string(b), "\n")
+
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return fmt.Errorf("Passed object has unsupported type: %s", v.Kind())
+	}
+	t := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		f := t.Field(i)
+		name := f.Tag.Get(`yaml`)
+		if name == "" {
+			continue
+		}
+		n := strings.IndexByte(name, byte(','))
+		if n != -1 {
+			name = name[0:n]
+		}
+		if name == "" || name == "-" {
+			continue
+		}
+		d := f.Tag.Get(`rem`)
+		j := findStringPrefix(astr, name)
+		if j != -1 {
+			astr = append(astr[:j+1], astr[j:]...)
+			astr[j] = `# ` + d
+		}
+	}
+	fmt.Fprintln(wr, strings.Join(astr, "\n"))
+	return nil
+}
+
+func SetupAction(args []string) {
+	optset := NewOptset(args)
+	pat := ""
+	optset.FlagLong(&pat, "pat", 0, "Personal access token", "STRING")
+	optset.SetParameters("USERNAME")
+	optset.Parse()
+
+	args = optset.Args()
+	if len(args) != 1 {
+		log.Fatalf("required argument (your GitHub user name) missing; try `%s --help' for assistance", optset.Command)
+	}
+
+	ReadConfig()
+	if VerifyStruct(&config, false) {
+		log.Printf("ghb appears to be set up already")
+		if pc, err := ParsePiesConfig(config.PiesConfigFile); err == nil {
+			if err, info := GetPiesInstanceInfo(pc.ControlURL); err == nil {
+				log.Printf("%s %s running with PID %d\n", info.PackageName, info.Version, info.PID)
+			}
+		}
+		os.Exit(1)
+	}
+
+	config.UserName = args[0]
+	if pat != "" {
+		config.PAT = pat
+	}
+
+	FinalizeConfig()
+	if ! VerifyStruct(&config, false) {
+		log.Fatalf("configuration fails sanity checking; run `%s configcheck' for more info", os.Args[0])
+	}
+
+	filename := filepath.Join(GetHomeDir(), `ghb.conf`)
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		log.Fatal("can't create %s: %v", filename, err)
+	}
+	//	config.NormalizePaths()
+	NormalizeRel(&config)
+	Annotate(&config, file)
+	file.Close()
+
+	PiesStart()
+	fmt.Printf("Setup finished.  Run `%s add' to add new runners.\n", os.Args[0])
 }
 
 func main() {
 	log.SetPrefix(filepath.Base(os.Args[0]) + ": ")
 	log.SetFlags(log.Lmsgprefix)
-
-	ReadConfig()
 
 	getopt.SetProgram(filepath.Base(os.Args[0]))
 	getopt.SetParameters("COMMAND [OPTIONS]")
@@ -1287,8 +1777,18 @@ func main() {
 				  Help: "Delete a runner"},
 		"list":    Action{Action: ListAction,
 				  Help: "List existing runners"},
-		"check":   Action{Action: CheckConfigAction,
-				  Help: "Check current configuration"},
+		"configcheck": Action{Action: CheckConfigAction,
+				      Help: "Check current configuration"},
+		"status":  Action{Action: StatusAction,
+				  Help: "Check ghb system status"},
+		"setup":   Action{Action: SetupAction,
+				  Help: "Set up GHB subsystem"},
+		"stop":    Action{Action: StopAction,
+				  Help: "Stop GNU pies supervisor"},
+		"start":   Action{Action: StartAction,
+				  Help: "Start GNU pies supervisor"},
+		"restart": Action{Action: RestartAction,
+				  Help: "Restart GNU pies supervisor"},
 		"help":    Action{Action: HelpAction,
 				  Help: "Show a short help summary"},
 	}
