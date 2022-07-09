@@ -57,13 +57,13 @@ var config = Config{
 	PiesConfigFile: ``,
 	// FIXME: Make sure the lines in the literal below are indented using spaces, not tabs.
 	// This way yaml marshaller prints the value in readable form.
-        ComponentTemplate: `component {{ RunnerName }} {
-        mode respawn;
-        chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
-        stderr syslog daemon.err;
-        stdout syslog daemon.info;
-        flags siggroup;
-        command "./run.sh";
+	ComponentTemplate: `component {{ RunnerName }} {
+	mode respawn;
+	chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
+	stderr syslog daemon.err;
+	stdout syslog daemon.info;
+	flags siggroup;
+	command "./run.sh";
 }
 `,
 }
@@ -1200,28 +1200,57 @@ func AddAction(args []string) {
 	ReadConfig()
 	FinalizeConfig()
 	optset := NewOptset(args)
-	optset.SetParameters("PROJECTNAME")
+	optset.SetParameters("[PROJECTNAME]")
 	optset.FlagLong(&config.UserName, "user", 0, "GitHub user name", "NAME")
-	optset.FlagLong(&config.PAT, "pat", 0, "Private authentication token", "STRING")
-	labels := ""
+
+	var (
+		PAT string
+		ProjectName string
+		ProjectUrl string
+		ProjectToken string
+		labels string
+	)
+	optset.FlagLong(&PAT, "pat", 0, "Private authentication token", "STRING")
+	optset.FlagLong(&ProjectUrl, "url", 'u', "Project URL", "URL")
+	optset.FlagLong(&ProjectToken, "token", 't', "Project token", "STRING")
 	optset.FlagLong(&labels, "labels", 'l', "Extra labels in addition to the default", "STRING")
 	optset.Parse()
 
-	args = optset.Args()
-	if len(args) != 1 {
-		log.Fatalf("bad number of arguments; try `%s --help' for assistance", optset.Command)
+	if PAT != "" {
+		config.PAT = PAT
 	}
 
-	ProjectName := args[0]
-	ProjectUrl := `https://github.com/` + config.UserName + `/` + ProjectName
+	args = optset.Args()
+	switch len(args) {
+	case 0:
+		if ProjectUrl == "" {
+			log.Fatalf("either --url or PROJECTNAME must be given; try `%s --help' for assistance", optset.Command)
+		}
+		ProjectName = filepath.Base(ProjectUrl)
 
-	ProjectToken := GetGitHubToken(RegistrationToken, ProjectName)
+	case 1:
+		ProjectName = args[0]
+		if ProjectUrl == "" {
+			if config.UserName == "" {
+				log.Fatalf(`Can't determine project URL.  To fix this, either supply your GitHub user name
+(via the --user option or the UserName statement in your configuration file)
+or give the URL explicitly using the --url option.`)
+			}
+			ProjectUrl = `https://github.com/` + config.UserName + `/` + ProjectName
+		}
+
+	default:
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
+	}
+
 	if ProjectToken == "" {
-		log.Println("Can't obtain a token for adding:")
-		log.Println(`Make sure sure your configuration file sets your GitHub user name (UserName:)
-and authorization token (PAT).  You can also supply these manually, using
-the --user and  --pat command line options.`)
-		os.Exit(1)
+		ProjectToken = GetGitHubToken(RegistrationToken, ProjectName)
+		if ProjectToken == "" {
+			log.Fatalf(`Can't obtain a token for adding.  To fix this, supply your GitHub user name
+(via the --user option or the UserName statement in your configuration file)
+and Private Access Token (via the --pat option or the PAT statement in the
+configuration), or give the token explicitly using the --token option.`)
+		}
 	}
 
 	pc, err := ParsePiesConfig(config.PiesConfigFile)
@@ -1314,6 +1343,7 @@ func ReadCachedToken(kind string) (string, error) {
 }
 
 func ObtainGitHubToken(kind, project string) (string, error) {
+	// FIXME: This works only for user. What about enterprise and organization?
 	req, err := http.NewRequest(http.MethodPost, "https://api.github.com/repos/" + config.UserName + "/" + project + "/actions/runners/" + kind, nil)
 	if err != nil {
 		return "", err
@@ -1363,13 +1393,22 @@ func DeleteAction(args []string) {
 	FinalizeConfig()
 	optset := NewOptset(args)
 	optset.SetParameters("PROJECTNAME [NUMBER]")
-	keep := false
+	var (
+		keep bool
+		force bool
+		PAT string
+		token string
+	)
 	optset.FlagLong(&keep, "keep", 'k', "Keep the configured runner directory")
-	force := false
 	optset.FlagLong(&force, "force", 'f', "Force removal of the runner directory")
 	optset.FlagLong(&config.UserName, "user", 0, "GitHub user name", "NAME")
-	optset.FlagLong(&config.PAT, "pat", 0, "Private authentication token", "STRING")
+	optset.FlagLong(&PAT, "pat", 0, "Private authentication token", "STRING")
+	optset.FlagLong(&token, "token", 0, "Removal token", "STRING")
 	optset.Parse()
+
+	if PAT != "" {
+		config.PAT = PAT
+	}
 
 	args = optset.Args()
 	var (
@@ -1397,20 +1436,18 @@ func DeleteAction(args []string) {
 		log.Fatal("--force and --keep can't be used together")
 	}
 
-	rem_token := ""
-	if !keep {
-		rem_token = GetGitHubToken(RemoveToken, projectName)
-		if rem_token == "" && !force {
-			log.Println("Can't obtain a token for removal:")
-			log.Println(`Make sure sure your configuration file sets your GitHub user name (UserName:)
-and authorization token (PAT).  You can also supply these manually, using
-the --user and  --pat command line options.
+	if token == "" && !keep {
+		token = GetGitHubToken(RemoveToken, projectName)
+		if token == "" && !force {
+			log.Fatalf(`Can't obtain a token for removal.  To fix this, either supply your GitHub user name
+(via the --user option or the UserName statement in your configuration file)
+and Private Access Token (via the --pat option or the PAT statement in the
+configuration), or give the token explicitly using the --token option.
 
 To remove the runner without deregistering it from GitHub, use the --force
 option.
 
 To remove the runner keeping its directory intact, use the --keep option.`)
-			os.Exit(1)
 		}
 	}
 
@@ -1437,8 +1474,8 @@ To remove the runner keeping its directory intact, use the --keep option.`)
 		}
 	}
 
-	if rem_token != "" {
-		if err := RemoveRunner(projectName + `_` + strconv.Itoa(runnerNum), r[i].Dir, rem_token); err != nil {
+	if token != "" {
+		if err := RemoveRunner(projectName + `_` + strconv.Itoa(runnerNum), r[i].Dir, token); err != nil {
 			log.Printf("failed to remove runner: %v", err)
 			if force {
 				log.Printf("continuing anyway")
