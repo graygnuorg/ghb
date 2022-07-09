@@ -33,12 +33,11 @@ import (
 	"golang.org/x/mod/semver"
 	"github.com/pborman/getopt/v2"
 	"gopkg.in/yaml.v2"
+	"github.com/graygnuorg/go-gdbm"
 )
 
 type Config struct {
 	Url string                `yaml:"url" rem:"URL of the runner application tarball"`
-	UserName string           `yaml:"user_name" rem:"Your GitHub user name"`
-	PAT string                `yaml:"pat" rem:"Personal Access Token (https://github.com/settings/tokens)"`
 	RootDir string            `yaml:"root_dir" rem:"Root directory" verify:"dir_exist"`
 	RunnersDir string         `yaml:"runners_dir" rem:"Directory for storing runners" verify:"dir_exist"  rel:"RootDir"`
 	CacheDir string           `yaml:"cache_dir" rem:"Cache directory" verify:"dir_exist" rel:"RootDir"`
@@ -57,13 +56,13 @@ var config = Config{
 	PiesConfigFile: ``,
 	// FIXME: Make sure the lines in the literal below are indented using spaces, not tabs.
 	// This way yaml marshaller prints the value in readable form.
-	ComponentTemplate: `component {{ RunnerName }} {
-	mode respawn;
-	chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
-	stderr syslog daemon.err;
-	stdout syslog daemon.info;
-	flags siggroup;
-	command "./run.sh";
+        ComponentTemplate: `component {{ RunnerName }} {
+        mode respawn;
+        chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
+        stderr syslog daemon.err;
+        stdout syslog daemon.info;
+        flags siggroup;
+        command "./run.sh";
 }
 `,
 }
@@ -414,6 +413,173 @@ func ExpandTemplate(text, runnerName string) (string, error) {
 	return sb.String(), nil
 }
 
+// ----------------------------------
+// Token database
+// ----------------------------------
+
+var (
+	ErrTokenNotFound = errors.New("Token not found")
+)
+
+func SaveToken(key string, token GHToken) error {
+	js, err := json.Marshal(token)
+	if err != nil {
+		return nil
+	}
+
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeWrcreat)
+	if err != nil {
+		return fmt.Errorf("can't open database file %s for update: %v", dbname, err)
+	}
+	defer db.Close()
+	if err := db.Store([]byte(key), js, true); err != nil {
+		return fmt.Errorf("can't store key %s: %v", key, err)
+	}
+	return nil
+}
+
+func FetchRawToken(key string) (GHToken, error) {
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeReader)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = ErrTokenNotFound
+		}
+		return GHToken{}, err
+	}
+	defer db.Close()
+	if js, err := db.Fetch([]byte(key)); err == nil {
+		var tok GHToken
+		err := json.Unmarshal(js, &tok)
+		return tok, err
+	} else if errors.Is(err, gdbm.ErrItemNotFound) {
+		return GHToken{}, ErrTokenNotFound
+	} else {
+		return GHToken{}, err
+	}
+}
+
+func FetchToken(key string) (string, error) {
+	if tok, err := FetchRawToken(key); err == nil {
+		if time.Now().Before(tok.ExpiresAt) {
+			return tok.Token, nil
+		}
+		return "", ErrTokenNotFound
+	} else {
+		return "", err
+	}
+}
+
+func DeleteToken(key string) error {
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeWrcreat)
+	if err != nil {
+		return fmt.Errorf("can't open database file %s for update: %v", dbname, err)
+	}
+	defer db.Close()
+	return db.Delete([]byte(key))
+}
+
+func PrefixIterator(pfx string) (func () (string, GHToken, error), error) {
+	dbname := filepath.Join(config.CacheDir, `token.db`)
+	db, err := gdbm.Open(dbname, gdbm.ModeReader)
+	if err != nil {
+		return nil, err
+	}
+
+	next := db.Iterator()
+	return func() (key string, tok GHToken, err error) {
+		for {
+			var b []byte
+			b, err = next()
+			if err == nil {
+				key = string(b)
+				if key != pfx && strings.TrimPrefix(key, pfx) != key {
+					var js []byte
+					if js, err = db.Fetch(b); err == nil {
+						if err = json.Unmarshal(js, &tok); err == nil {
+							return
+						}
+					}
+					break
+				}
+			} else {
+				break
+			}
+		}
+		db.Close()
+		return
+	}, nil
+}
+
+
+func getGitHubToken(key, pat string) (token GHToken, err error) {
+	var req *http.Request
+	req, err = http.NewRequest(http.MethodPost, `https://api.github.com` + key, nil)
+	if err != nil {
+		return
+	}
+
+	req.Header.Add("Accept", "application/vnd.github+json")
+	req.Header.Add("Authorization", "token " + pat)
+	fmt.Printf("Getting token for %s\n", req.URL.String())
+	//fmt.Printf("%#v",req)
+	var resp *http.Response
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var body []byte
+	if body, err = ioutil.ReadAll(resp.Body); err != nil {
+		return
+	}
+	if resp.StatusCode == 201 {
+		err = json.Unmarshal(body, &token)
+	} else {
+		err = ErrTokenNotFound
+	}
+	return
+}
+
+func GetPATKey(key string) (patkey string, ispat bool) {
+	for _, pfx := range GHEntityPrefix {
+		if s := strings.TrimPrefix(key, pfx); s != key {
+			if n := strings.IndexRune(s, '/'); n == -1 {
+				patkey = key
+				ispat = true
+			} else {
+				patkey = pfx
+				ispat = false
+				patkey = patkey + s[:n]
+			}
+			break
+		}
+	}
+	return
+}
+
+func GetToken(key string) (string, error) {
+	if token, err := FetchToken(key); err == nil {
+		return token, err
+	} else if errors.Is(err, ErrTokenNotFound) {
+		if patkey, ispat := GetPATKey(key); ispat {
+			return "", err
+		} else if token, err := FetchToken(patkey); err == nil {
+			if tok, err := getGitHubToken(key, token); err != nil {
+				return "", err
+			} else {
+				SaveToken(key, tok)
+				return tok.Token, err
+			}
+		} else {
+			return "", err
+		}
+	} else {
+		return "", err
+	}
+}
 
 // ----------------------------------
 // Pies configuration file lexer
@@ -863,8 +1029,7 @@ func (pc *PiesConfig) ParseComponent(l *Lexer) error {
 	runnerName := ""
 	r := Runner{TokenStart: start}
 	if t.IsText() {
-		m := runnerNameRx.FindStringSubmatch(t.Text)
-		if m != nil {
+		if m := runnerNameRx.FindStringSubmatch(t.Text); m != nil {
 			n, err := strconv.Atoi(m[2])
 			if err == nil {
 				runnerName = m[1]
@@ -1144,6 +1309,50 @@ func (optset *Optset) Parse() {
 	}
 }
 
+type EntityOptset struct {
+	*Optset
+	Entity entityValue
+}
+
+type entityValue struct {
+	Type int
+	Name string
+}
+
+func (ent *entityValue) Set(value string, opt getopt.Option) error {
+        switch opt.LongName() {
+	case `org`:
+		ent.Type = EntityOrg
+	case `enterprise`:
+		ent.Type = EntityEnterprise
+	case `repo`:
+		ent.Type = EntityRepo
+	}
+	ent.Name = value
+
+        return nil
+}
+
+func (ent *entityValue) String() string {
+        return ent.Name
+}
+
+func NewEntityOptset(args []string) (optset *EntityOptset) {
+	optset = new(EntityOptset)
+	optset.Optset = NewOptset(args)
+	optset.FlagLong(&optset.Entity, "org", 0, "Organization").SetGroup("entity")
+	optset.FlagLong(&optset.Entity, "enterprise", 0, "Enterprize").SetGroup("entity")
+	optset.FlagLong(&optset.Entity, "repo", 0, "Repository").SetGroup("entity")
+	return optset
+}
+
+func (optset *EntityOptset) Parse() {
+	optset.Optset.Parse()
+	if optset.Entity.Name == "" {
+		log.Fatalf("One of --org, --enterprise, or --repo must be given")
+	}
+}
+
 var actions map[string]Action
 
 func HelpAction(args []string) {
@@ -1199,57 +1408,61 @@ func ListAction(args []string) {
 func AddAction(args []string) {
 	ReadConfig()
 	FinalizeConfig()
-	optset := NewOptset(args)
+	optset := NewEntityOptset(args)
 	optset.SetParameters("[PROJECTNAME]")
-	optset.FlagLong(&config.UserName, "user", 0, "GitHub user name", "NAME")
 
 	var (
-		PAT string
 		ProjectName string
 		ProjectUrl string
 		ProjectToken string
 		labels string
 	)
-	optset.FlagLong(&PAT, "pat", 0, "Private authentication token", "STRING")
 	optset.FlagLong(&ProjectUrl, "url", 'u', "Project URL", "URL")
 	optset.FlagLong(&ProjectToken, "token", 't', "Project token", "STRING")
 	optset.FlagLong(&labels, "labels", 'l', "Extra labels in addition to the default", "STRING")
 	optset.Parse()
 
-	if PAT != "" {
-		config.PAT = PAT
-	}
-
 	args = optset.Args()
 	switch len(args) {
 	case 0:
-		if ProjectUrl == "" {
-			log.Fatalf("either --url or PROJECTNAME must be given; try `%s --help' for assistance", optset.Command)
+		if optset.Entity.Type == EntityRepo {
+			if n := strings.Index(optset.Entity.Name, `/`); n != -1 {
+				ProjectName = optset.Entity.Name[n+1:]
+			}
 		}
-		ProjectName = filepath.Base(ProjectUrl)
+
+		if ProjectName == "" {
+			if ProjectUrl == "" {
+				log.Fatalf("either --url or PROJECTNAME must be given; try `%s --help' for assistance", optset.Command)
+			}
+			ProjectName = filepath.Base(ProjectUrl)
+		}
 
 	case 1:
 		ProjectName = args[0]
-		if ProjectUrl == "" {
-			if config.UserName == "" {
-				log.Fatalf(`Can't determine project URL.  To fix this, either supply your GitHub user name
-(via the --user option or the UserName statement in your configuration file)
-or give the URL explicitly using the --url option.`)
-			}
-			ProjectUrl = `https://github.com/` + config.UserName + `/` + ProjectName
-		}
 
 	default:
 		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
 	}
 
+	if optset.Entity.Type == EntityRepo {
+		//FIXME: is that needed?
+		if n := strings.Index(optset.Entity.Name, `/`); n == -1 {
+			optset.Entity.Name += `/` + ProjectName
+		} else if optset.Entity.Name[n+1:] != ProjectName {
+			log.Fatal("repository suffix doesn't match project name")
+		}
+	}
+
+	if ProjectUrl == "" {
+		ProjectUrl = optset.Entity.ProjectURL(ProjectName)
+	}
+
 	if ProjectToken == "" {
-		ProjectToken = GetGitHubToken(RegistrationToken, ProjectName)
-		if ProjectToken == "" {
-			log.Fatalf(`Can't obtain a token for adding.  To fix this, supply your GitHub user name
-(via the --user option or the UserName statement in your configuration file)
-and Private Access Token (via the --pat option or the PAT statement in the
-configuration), or give the token explicitly using the --token option.`)
+		var err error
+		ProjectToken, err = GetToken(optset.Entity.TokenKey(RegistrationToken, ProjectName))
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
@@ -1315,100 +1528,57 @@ func RemoveRunner(name, dirname, token string) error {
 }
 
 const (
+	EntityEnterprise = iota
+	EntityOrg
+	EntityRepo
+
 	RemoveToken = `remove-token`
 	RegistrationToken = `registration-token`
 )
+
+var GHEntityPrefix = []string{
+	`/enterprises/`,
+	`/orgs/`,
+	`/repos/`,
+}
+
+func (ent entityValue) PATKey() string {
+	return GHEntityPrefix[ent.Type] + ent.Name
+}
+
+func (ent entityValue) TokenKey(kind, project string) string {
+	//FIXME
+	if ent.Type == EntityRepo {
+		return ent.PATKey() + `/actions/runners/` + kind
+	} else {
+		return ent.PATKey() + `/` + project + `/actions/runners/` + kind
+	}
+}
+
+func (ent entityValue) ProjectURL(name string) string {
+	//FIXME
+	return `https://github.com/` + ent.Name + `/` + name
+}
 
 type GHToken struct {
 	Token string         `json:"token"`
 	ExpiresAt time.Time  `json:"expires_at"`
 }
 
-func ReadCachedToken(kind string) (string, error) {
-	filename := filepath.Join(config.CacheDir, `.` + kind)
-	content, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return "", err
-	}
-	var tok GHToken
-	if err := json.Unmarshal([]byte(content), &tok); err != nil {
-		return "", err
-	}
-
-	if time.Now().Before(tok.ExpiresAt) {
-		return tok.Token, nil
-	}
-
-	return "", os.ErrNotExist
-}
-
-func ObtainGitHubToken(kind, project string) (string, error) {
-	// FIXME: This works only for user. What about enterprise and organization?
-	req, err := http.NewRequest(http.MethodPost, "https://api.github.com/repos/" + config.UserName + "/" + project + "/actions/runners/" + kind, nil)
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Add("Accept", "application/vnd.github+json")
-	req.Header.Add("Authorization", "token " + config.PAT)
-	fmt.Printf("Getting %s token for %s\n", kind, req.URL.String())
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var tok GHToken
-	if body, err := ioutil.ReadAll(resp.Body); err == nil {
-		if err := json.Unmarshal(body, &tok); err != nil {
-			return "", err
-		}
-		ioutil.WriteFile(filepath.Join(config.CacheDir, `.` + kind), body, 0640)
-	} else {
-		return "", err
-	}
-	return tok.Token, nil
-}
-
-func GetGitHubToken(kind, projectName string) string {
-	if t, err := ReadCachedToken(kind); err == nil {
-		return t
-	} else {
-		if !errors.Is(err, os.ErrNotExist) {
-			log.Println(err)
-		}
-		if config.UserName != "" && config.PAT != "" {
-			if t, err := ObtainGitHubToken(kind, projectName); err == nil {
-				return t
-			} else {
-				log.Println(err)
-			}
-		}
-	}
-	return ""
-}
-
 func DeleteAction(args []string) {
 	ReadConfig()
 	FinalizeConfig()
-	optset := NewOptset(args)
+	optset := NewEntityOptset(args)
 	optset.SetParameters("PROJECTNAME [NUMBER]")
 	var (
 		keep bool
 		force bool
-		PAT string
 		token string
 	)
 	optset.FlagLong(&keep, "keep", 'k', "Keep the configured runner directory")
 	optset.FlagLong(&force, "force", 'f', "Force removal of the runner directory")
-	optset.FlagLong(&config.UserName, "user", 0, "GitHub user name", "NAME")
-	optset.FlagLong(&PAT, "pat", 0, "Private authentication token", "STRING")
 	optset.FlagLong(&token, "token", 0, "Removal token", "STRING")
 	optset.Parse()
-
-	if PAT != "" {
-		config.PAT = PAT
-	}
 
 	args = optset.Args()
 	var (
@@ -1432,22 +1602,23 @@ func DeleteAction(args []string) {
 		log.Fatalf("wrong number of arguments; try `%s --help' for assistance", optset.Command)
 	}
 
+	if optset.Entity.Type == EntityRepo {
+		if s := strings.TrimSuffix(optset.Entity.Name, `/` + projectName); s != optset.Entity.Name {
+			// ok
+		} else if n := strings.Index(optset.Entity.Name, `/`); n == -1 {
+			optset.Entity.Name += `/` + projectName
+		}
+	}
+
 	if force && keep {
 		log.Fatal("--force and --keep can't be used together")
 	}
 
 	if token == "" && !keep {
-		token = GetGitHubToken(RemoveToken, projectName)
-		if token == "" && !force {
-			log.Fatalf(`Can't obtain a token for removal.  To fix this, either supply your GitHub user name
-(via the --user option or the UserName statement in your configuration file)
-and Private Access Token (via the --pat option or the PAT statement in the
-configuration), or give the token explicitly using the --token option.
-
-To remove the runner without deregistering it from GitHub, use the --force
-option.
-
-To remove the runner keeping its directory intact, use the --keep option.`)
+		var err error
+		token, err = GetToken(optset.Entity.TokenKey(RemoveToken, projectName))
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
@@ -1752,9 +1923,9 @@ func Annotate(obj interface{}, wr io.Writer) error {
 
 func SetupAction(args []string) {
 	optset := NewOptset(args)
-	pat := ""
-	optset.FlagLong(&pat, "pat", 0, "Personal access token", "STRING")
-	optset.SetParameters("USERNAME")
+	optset.SetParameters("")
+	make_config := false
+	optset.FlagLong(&make_config, "make-config", 0, "Create ghb.conf configuration file")
 	optset.Parse()
 
 	args = optset.Args()
@@ -1773,28 +1944,110 @@ func SetupAction(args []string) {
 		os.Exit(1)
 	}
 
-	config.UserName = args[0]
-	if pat != "" {
-		config.PAT = pat
-	}
-
 	FinalizeConfig()
 	if ! VerifyStruct(&config, false) {
 		log.Fatalf("configuration fails sanity checking; run `%s configcheck' for more info", os.Args[0])
 	}
 
-	filename := filepath.Join(GetHomeDir(), `ghb.conf`)
-	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		log.Fatal("can't create %s: %v", filename, err)
+	if make_config {
+		filename := filepath.Join(GetHomeDir(), `ghb.conf`)
+		file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+		if err != nil {
+			log.Fatal("can't create %s: %v", filename, err)
+		}
+		NormalizeRel(&config)
+		Annotate(&config, file)
+		file.Close()
 	}
-	//	config.NormalizePaths()
-	NormalizeRel(&config)
-	Annotate(&config, file)
-	file.Close()
 
 	PiesStart()
 	fmt.Printf("Setup finished.  Run `%s add' to add new runners.\n", os.Args[0])
+}
+
+type timeValue time.Time
+
+func (tv *timeValue) Set(value string, opt getopt.Option) error {
+	if s := strings.TrimPrefix(value, `+`); s != value {
+		if d, err := time.ParseDuration(s); err == nil {
+			*tv = timeValue(time.Now().Add(d))
+		} else {
+			return err
+		}
+	} else if t, err := time.Parse("2006-01-02 15:04:05", value); err != nil {
+		return err
+	} else {
+		*tv = timeValue(t)
+	}
+	return nil
+}
+
+func (tv *timeValue) String() string {
+	return time.Time(*tv).String()
+}
+
+func (tok GHToken) Print() {
+	fmt.Printf("Token: %s\n", tok.Token)
+	if time.Now().Before(tok.ExpiresAt) {
+		if t, err := tok.ExpiresAt.MarshalText(); err == nil {
+			fmt.Printf("Expires at: %s\n", string(t))
+		}
+	} else {
+		if t, err := tok.ExpiresAt.MarshalText(); err == nil {
+			fmt.Printf("Expired (at: %s)\n", string(t))
+		} else {
+			fmt.Printf("Expired!\n")
+		}
+	}
+}
+
+func PatAction(args []string) {
+	ReadConfig()
+	optset := NewEntityOptset(args)
+	optset.SetParameters("")
+	var (
+		expiration timeValue
+		token string
+		delete bool
+		all bool
+	)
+	optset.FlagLong(&token, "set", 's', "Set new PAT", "STRING")
+	optset.FlagLong(&expiration, "expires", 'e', "STRING")
+	optset.FlagLong(&delete, "delete", 'd', "Delete PAT")
+	optset.FlagLong(&all, "all", 'a', "List all keys for the given entity")
+	optset.Parse()
+
+	if delete && token != "" {
+		log.Fatal("--delete and --set cannot be used together")
+	}
+
+	if delete {
+		if err := DeleteToken(optset.Entity.PATKey()); err != nil {
+			log.Fatal(err)
+		}
+	} else if token == "" {
+		if tok, err := FetchRawToken(optset.Entity.PATKey()); err == nil {
+			tok.Print()
+			if all {
+				if next, err := PrefixIterator(optset.Entity.PATKey()); err == nil {
+					for key, tok, err := next(); err == nil; key, tok, err = next() {
+						fmt.Printf("\nName: %s\n", key)
+						tok.Print()
+					}
+				}
+			}
+		} else {
+			log.Fatal(err)
+		}
+	} else {
+		exptime := time.Time(expiration)
+		if exptime.IsZero() {
+			exptime = time.Now().Add(time.Hour * 24 * 7)
+		}
+		tok := GHToken{Token: token, ExpiresAt: exptime}
+		if err := SaveToken(optset.Entity.PATKey(), tok); err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 
 func main() {
@@ -1828,6 +2081,9 @@ func main() {
 				  Help: "Restart GNU pies supervisor"},
 		"help":    Action{Action: HelpAction,
 				  Help: "Show a short help summary"},
+		"pat":     Action{Action: PatAction,
+                                  Help: "Manage private access keys"},
+//		"try":    Action{Action: TryAction, Help: "Guess what..."},
 	}
 
 	if len(os.Args) == 1 {
