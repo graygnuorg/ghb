@@ -39,7 +39,7 @@ var config = Config{
 	PiesConfigFile: ``,
 	// FIXME: Make sure the lines in the literal below are indented using spaces, not tabs.
 	// This way yaml marshaller prints the value in readable form.
-        ComponentTemplate: `component {{ RunnerName }} {
+        ComponentTemplate: `component "{{ RunnerName }}" {
         mode respawn;
         chdir "{{ Config.RunnersDir }}/{{ RunnerName }}";
         stderr syslog daemon.err;

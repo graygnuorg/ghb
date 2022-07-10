@@ -50,18 +50,16 @@ func (ent entityValue) PATKey() string {
 	return ent.BaseKey()
 }
 
-func (ent entityValue) TokenKey(kind, project string) string {
-	//FIXME
-	if ent.Type == EntityRepo {
-		return ent.BaseKey() + `/actions/runners/` + kind
-	} else {
-		return ent.BaseKey() + `/` + project + `/actions/runners/` + kind
-	}
+func (ent entityValue) TokenKey(kind string) string {
+	return ent.BaseKey() + `/actions/runners/` + kind
 }
 
-func (ent entityValue) ProjectURL(name string) string {
-	//FIXME
-	return `https://github.com/` + ent.Name + `/` + name
+func (ent entityValue) ProjectURL(name string) (url string) {
+	url = `https://github.com/` + ent.Name
+	if name != "" {
+		url += `/` + name
+	}
+	return
 }
 
 type GHToken struct {

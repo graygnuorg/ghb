@@ -454,7 +454,7 @@ func (pc *PiesConfig) Write(w io.Writer) (err error) {
 	return
 }
 
-var runnerNameRx = regexp.MustCompile(`^(.+?)_(\d+)`)
+var runnerNameRx = regexp.MustCompile(`^(.+?)/(\d+)`)
 
 func (pc *PiesConfig) ParseComponent(l *Lexer) error {
 	start := len(l.tokens) - 1

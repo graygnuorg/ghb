@@ -22,9 +22,10 @@ import (
 	"github.com/pborman/getopt/v2"
 //?	"gopkg.in/yaml.v2"
 	"runtime"
+	"net/url"
 )
 
-func InstallToDir(arc, projectName, projectUrl, projectToken, labels string) error {
+func InstallToDir(arc, projectName, projectUrl, projectToken string, opts []string) error {
 	dirname := filepath.Join(config.RunnersDir, projectName)
 	if err := os.MkdirAll(dirname, 0750); err != nil {
 		return fmt.Errorf("Can't create %s: %v", dirname, err)
@@ -53,18 +54,17 @@ func InstallToDir(arc, projectName, projectUrl, projectToken, labels string) err
 		return fmt.Errorf("Can't determine hostname: %v", err)
 	}
 
-	name := hostname + `_` + projectName
+	name := hostname + `_` + filepath.Base(projectName)
 
 	fmt.Printf("Configuring %s\n", name)
-	cmdline := []string{
+	cmdline := append([]string{
 		"--name", name,
 		"--url", projectUrl,
 		"--token", projectToken,
 		"--unattended",
-	}
-	if labels != "" {
-		cmdline = append(cmdline, "--labels", labels)
-	}
+	},
+		opts...)
+	//fmt.Println(cmdline)
 	cmd = exec.Command("./config.sh", cmdline...)
 
 	cmd.Stdin = os.Stdin
@@ -235,10 +235,12 @@ func AddAction(args []string) {
 		ProjectUrl string
 		ProjectToken string
 		labels string
+		runnergroup string
 	)
 	optset.FlagLong(&ProjectUrl, "url", 'u', "Project URL", "URL")
 	optset.FlagLong(&ProjectToken, "token", 't', "Project token", "STRING")
 	optset.FlagLong(&labels, "labels", 'l', "Extra labels in addition to the default", "STRING")
+	optset.FlagLong(&runnergroup, "runnergroup", 'g', "Name of the runner group", "STRING")
 	optset.Parse()
 
 	args = optset.Args()
@@ -247,25 +249,27 @@ func AddAction(args []string) {
 		if optset.Entity.Type == EntityRepo {
 			if n := strings.Index(optset.Entity.Name, `/`); n != -1 {
 				ProjectName = optset.Entity.Name[n+1:]
+			} else if ProjectUrl == "" {
+				log.Fatalf("for --repo either --url or PROJECTNAME must be given; try `%s --help' for assistance", optset.Command)
+			} else if u, err := url.Parse(ProjectUrl); err != nil {
+				log.Fatal(err)
+			} else {
+				ProjectName = u.Path
 			}
-		}
-
-		if ProjectName == "" {
-			if ProjectUrl == "" {
-				log.Fatalf("either --url or PROJECTNAME must be given; try `%s --help' for assistance", optset.Command)
-			}
-			ProjectName = filepath.Base(ProjectUrl)
 		}
 
 	case 1:
-		ProjectName = args[0]
+		if optset.Entity.Type == EntityRepo {
+			ProjectName = args[0]
+		} else {
+			log.Fatal("PROJECTNAME is allowed only with the --repo option")
+		}
 
 	default:
 		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
 	}
 
 	if optset.Entity.Type == EntityRepo {
-		//FIXME: is that needed?
 		if n := strings.Index(optset.Entity.Name, `/`); n == -1 {
 			optset.Entity.Name += `/` + ProjectName
 		} else if optset.Entity.Name[n+1:] != ProjectName {
@@ -279,7 +283,7 @@ func AddAction(args []string) {
 
 	if ProjectToken == "" {
 		var err error
-		ProjectToken, err = GetToken(optset.Entity.TokenKey(RegistrationToken, ProjectName))
+		ProjectToken, err = GetToken(optset.Entity.TokenKey(RegistrationToken))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -291,20 +295,27 @@ func AddAction(args []string) {
 	}
 
 	n := 0
-	r, ok := pc.Runners[ProjectName]
+	r, ok := pc.Runners[optset.Entity.BaseKey()]
 	if ok {
 		n = r[len(r)-1].Num + 1
 	}
 
-	name := ProjectName + `_` + strconv.Itoa(n)
-	// FIXME: check if dirname exists
+	name := filepath.Join(optset.Entity.BaseKey(), strconv.Itoa(n))
+	// FIXME: check if dirname exists?
 
 	arcfile, err := GetRunnerArchive(optset.Entity)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := InstallToDir(arcfile, name, ProjectUrl, ProjectToken, labels); err != nil {
+	opts := []string{}
+	if labels != "" {
+		opts = append(opts, "--labels", labels)
+	}
+	if runnergroup != "" {
+		opts = append(opts, "--runnergroup", runnergroup)
+	}
+	if err := InstallToDir(arcfile, name, ProjectUrl, ProjectToken, opts); err != nil {
 		log.Fatal(err)
 	}
 
@@ -321,7 +332,7 @@ func AddAction(args []string) {
 	}
 }
 
-func RemoveRunner(name, dirname, token string) error {
+func RemoveRunner(dirname, token string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("can't get cwd: %v", err)
@@ -338,7 +349,7 @@ func RemoveRunner(name, dirname, token string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("Error removing %s: %v", name, err)
+		return err
 	}
 
 	if err := os.Chdir(cwd); err != nil {
@@ -355,44 +366,47 @@ func DeleteAction(args []string) {
 	ReadConfig()
 	FinalizeConfig()
 	optset := NewEntityOptset(args)
-	optset.SetParameters("PROJECTNAME [NUMBER]")
+	optset.SetParameters("[PROJECTNAME]")
 	var (
 		keep bool
 		force bool
 		token string
+		runnerNum = -1
+		projectName string
 	)
 	optset.FlagLong(&keep, "keep", 'k', "Keep the configured runner directory")
 	optset.FlagLong(&force, "force", 'f', "Force removal of the runner directory")
 	optset.FlagLong(&token, "token", 0, "Removal token", "STRING")
+	optset.FlagLong(&runnerNum, "id", 'i', "Runner ID", "NUMBER")
 	optset.Parse()
 
 	args = optset.Args()
-	var (
-		projectName string
-		runnerNum int
-	)
 	switch len(args) {
-	case 2:
-		projectName = args[0]
-		n, err := strconv.Atoi(args[1])
-		if err != nil {
-			log.Fatalf("bad runner number: %s", args[1])
+	case 0:
+		if optset.Entity.Type == EntityRepo {
+			if n := strings.Index(optset.Entity.Name, `/`); n != -1 {
+				projectName = optset.Entity.Name[n+1:]
+			} else {
+				log.Fatalf("PROJECTNAME must be given with the --repo option; try `%s --help' for assistance", optset.Command)
+			}
 		}
-		runnerNum = n
 
 	case 1:
-		projectName = args[0]
-		runnerNum = -1	// remove last
+		if optset.Entity.Type == EntityRepo {
+			projectName = args[0]
+		} else {
+			log.Fatal("PROJECTNAME is allowed only with the --repo option")
+		}
 
 	default:
-		log.Fatalf("wrong number of arguments; try `%s --help' for assistance", optset.Command)
+		log.Fatalf("too many arguments; try `%s --help' for assistance", optset.Command)
 	}
 
 	if optset.Entity.Type == EntityRepo {
-		if s := strings.TrimSuffix(optset.Entity.Name, `/` + projectName); s != optset.Entity.Name {
-			// ok
-		} else if n := strings.Index(optset.Entity.Name, `/`); n == -1 {
+		if n := strings.Index(optset.Entity.Name, `/`); n == -1 {
 			optset.Entity.Name += `/` + projectName
+		} else if optset.Entity.Name[n+1:] != projectName {
+			log.Fatal("repository suffix doesn't match project name")
 		}
 	}
 
@@ -402,7 +416,7 @@ func DeleteAction(args []string) {
 
 	if token == "" && !keep {
 		var err error
-		token, err = GetToken(optset.Entity.TokenKey(RemoveToken, projectName))
+		token, err = GetToken(optset.Entity.TokenKey(RemoveToken))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -413,9 +427,9 @@ func DeleteAction(args []string) {
 		log.Panic(err)
 	}
 
-	r, ok := pc.Runners[projectName]
+	r, ok := pc.Runners[optset.Entity.BaseKey()]
 	if !ok {
-		log.Fatalf("found no runners for %s", projectName)
+		log.Fatalf("found no runners for %s", optset.Entity.BaseKey())
 	}
 
 	var i int
@@ -423,16 +437,16 @@ func DeleteAction(args []string) {
 	if runnerNum == -1 {
 		i = len(r) - 1
 		runnerNum = r[i].Num
-		fmt.Printf("Removing runner %s_%d\n", projectName, runnerNum)
+		fmt.Printf("Removing runner %s/%d\n", optset.Entity.BaseKey(), runnerNum)
 	} else {
 		i = sort.Search(len(r), func(i int) bool { return r[i].Num >= runnerNum })
 		if !(i < len(r) && r[i].Num == runnerNum) {
-			log.Fatalf("%s: no runner %d", projectName, runnerNum)
+			log.Fatalf("%s: no runner %d", optset.Entity.BaseKey(), runnerNum)
 		}
 	}
 
 	if token != "" {
-		if err := RemoveRunner(projectName + `_` + strconv.Itoa(runnerNum), r[i].Dir, token); err != nil {
+		if err := RemoveRunner(r[i].Dir, token); err != nil {
 			log.Printf("failed to remove runner: %v", err)
 			if force {
 				log.Printf("continuing anyway")
