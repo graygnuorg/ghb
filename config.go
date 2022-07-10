@@ -22,7 +22,6 @@ import (
 )
 
 type Config struct {
-	Url string                `yaml:"url" rem:"URL of the runner application tarball"`
 	RootDir string            `yaml:"root_dir" rem:"Root directory" verify:"dir_exist"`
 	RunnersDir string         `yaml:"runners_dir" rem:"Directory for storing runners" verify:"dir_exist"  rel:"RootDir"`
 	CacheDir string           `yaml:"cache_dir" rem:"Cache directory" verify:"dir_exist" rel:"RootDir"`
@@ -33,7 +32,6 @@ type Config struct {
 }
 
 var config = Config{
-	Url: `https://github.com/actions/runner/releases/download/v2.294.0/actions-runner-linux-x64-2.294.0.tar.gz`,
 	RunnersDir: ``,
 	CacheDir: ``,
 	Tar: `tar`,

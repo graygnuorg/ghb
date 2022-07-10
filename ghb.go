@@ -8,8 +8,6 @@ package main
 import (
 	"os"
 	"os/exec"
-	"net/http"
-	"io"
 	"fmt"
 	"path/filepath"
 	"log"
@@ -23,59 +21,12 @@ import (
 	"golang.org/x/mod/semver"
 	"github.com/pborman/getopt/v2"
 //?	"gopkg.in/yaml.v2"
-//	"github.com/graygnuorg/go-gdbm"
+	"runtime"
 )
 
-func download(name string) error {
-	out, err := os.Create(name)
-	if err != nil  {
-		return err
-	}
-	defer out.Close()
-
-	resp, err := http.Get(config.Url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	_, err = io.Copy(out, resp.Body)
-	if err != nil  {
-		os.Remove(name)
-	}
-	return err
-}
-
-func GetArchiveFile() (filename string, err error) {
-	filename = filepath.Join(config.CacheDir, filepath.Base(config.Url))
-	_, err = os.Stat(filename)
-	switch {
-	case err == nil:
-		fmt.Printf("Using cached copy %s\n", filename)
-		break
-	case os.IsNotExist(err):
-		fmt.Printf("Downloading %s\n", config.Url)
-		err = download(filename)
-	default:
-		err = fmt.Errorf("Can't stat %s: %v", filename, err)
-	}
-
-	return
-}
-
-func InstallToDir(projectName, projectUrl, projectToken, labels string) error {
-	arc, err := GetArchiveFile()
-	if err != nil {
-		return err
-	}
-
+func InstallToDir(arc, projectName, projectUrl, projectToken, labels string) error {
 	dirname := filepath.Join(config.RunnersDir, projectName)
-	err = os.MkdirAll(dirname, 0750)
-	if err != nil {
+	if err := os.MkdirAll(dirname, 0750); err != nil {
 		return fmt.Errorf("Can't create %s: %v", dirname, err)
 	}
 
@@ -88,15 +39,12 @@ func InstallToDir(projectName, projectUrl, projectToken, labels string) error {
 		return fmt.Errorf("Error running %s: %v", config.Tar, err)
 	}
 
-	var cwd string
-	cwd, err = os.Getwd()
-	if err != nil {
+	if cwd, err := os.Getwd(); err != nil {
 		return fmt.Errorf("Can't get cwd: %v", err)
+	} else {
+		defer os.Chdir(cwd)
 	}
-	defer os.Chdir(cwd)
-
-	err = os.Chdir(dirname)
-	if err != nil {
+	if err := os.Chdir(dirname); err != nil {
 		return fmt.Errorf("Can't chdir to %s: %v", dirname, err)
 	}
 
@@ -351,7 +299,12 @@ func AddAction(args []string) {
 	name := ProjectName + `_` + strconv.Itoa(n)
 	// FIXME: check if dirname exists
 
-	if err := InstallToDir(name, ProjectUrl, ProjectToken, labels); err != nil {
+	arcfile, err := GetRunnerArchive(optset.Entity)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := InstallToDir(arcfile, name, ProjectUrl, ProjectToken, labels); err != nil {
 		log.Fatal(err)
 	}
 
@@ -495,7 +448,6 @@ func DeleteAction(args []string) {
 	if err := PiesReloadConfig(pc.ControlURL); err != nil {
 		log.Fatalf("Pies configuration updated, but pies not reloaded: %v", err)
 	}
-
 }
 
 func CheckConfigAction(args []string) {
@@ -810,6 +762,30 @@ func PatAction(args []string) {
 	}
 }
 
+func TryAction(args []string) {
+	ReadConfig()
+	optset := NewEntityOptset(args)
+	optset.SetParameters("")
+	optset.Parse()
+
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x64"
+	}
+	fmt.Printf("os: %s\n", runtime.GOOS)
+	fmt.Printf("arch: %s\n", arch)
+
+	res, err := GitHubGetDownloads(optset.Entity)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, dn := range res {
+		if dn.OS == runtime.GOOS && dn.Arch == arch {
+			fmt.Println(dn)
+		}
+	}
+}
+
 func main() {
 	log.SetPrefix(filepath.Base(os.Args[0]) + ": ")
 	log.SetFlags(log.Lmsgprefix)
@@ -843,7 +819,7 @@ func main() {
 				  Help: "Show a short help summary"},
 		"pat":     Action{Action: PatAction,
                                   Help: "Manage private access keys"},
-//		"try":    Action{Action: TryAction, Help: "Guess what..."},
+		"try":    Action{Action: TryAction, Help: "Dont use it, unless you know what you're doing"},
 	}
 
 	if len(os.Args) == 1 {
