@@ -455,7 +455,12 @@ func DeleteAction(args []string) {
 		}
 	}
 
-	pc.Tokens = append(pc.Tokens[:r[i].TokenStart], pc.Tokens[r[i].TokenEnd+1:]...)
+	n := r[i].TokenEnd + 1
+	if pc.Tokens[n].Text == "\n" {
+		n += 1
+	}
+	pc.Tokens = append(pc.Tokens[:r[i].TokenStart], pc.Tokens[n:]...)
+
 	if err := pc.Save(); err != nil {
 		log.Fatal(err)
 	}
