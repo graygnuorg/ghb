@@ -50,10 +50,12 @@ var config = Config{
 `,
 }
 
+var DefaultPiesPort = "8073"
+
 var PiesConfigStub = `
 pidfile {{ Config.RootDir }}/pies.pid;
 control {
-	socket "inet://127.0.0.1:8073";
+	socket "inet://127.0.0.1:{{ Port }}";
 }
 `
 
@@ -260,6 +262,7 @@ func CreateFileFromStub(filename, stub string) error {
 	fmt.Printf("Creating file %s\n", filename)
 	tmpl, err := template.New("file").Funcs(template.FuncMap{
 		"Config": func () *Config { return &config },
+		"Port": func () string { return DefaultPiesPort },
 	}).Parse(stub)
 	if err != nil {
 		return fmt.Errorf("can't parse template: %v", err)

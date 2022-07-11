@@ -21,7 +21,6 @@ import (
 	"golang.org/x/mod/semver"
 	"github.com/pborman/getopt/v2"
 //?	"gopkg.in/yaml.v2"
-	"runtime"
 	"net/url"
 )
 
@@ -185,7 +184,7 @@ func HelpAction(args []string) {
 	fmt.Printf("usage: %s COMMAND [ARGS...]\n", filepath.Base(os.Args[0]))
 	fmt.Printf("Available commands:\n")
 	for _, com := range commands {
-		fmt.Printf("    %-10s  %s\n", com, actions[com].Help)
+		fmt.Printf("    %-12s  %s\n", com, actions[com].Help)
 	}
 	fmt.Printf("To obtain a help on a particular command, run: %s COMMAND -h\n", filepath.Base(os.Args[0]))
 }
@@ -521,6 +520,7 @@ func StatusAction(args []string) {
 	if VerifyStruct(&config, verbose) {
 		fmt.Println("Configuration file passed syntax check")
 	} else {
+		log.Printf("Configuration check failed; try `%s --verbose` for details", optset.Command)
 		os.Exit(1)
 	}
 
@@ -625,6 +625,8 @@ func RestartAction(args []string) {
 		if err := PiesStopInstance(pc.ControlURL); err != nil {
 			log.Fatal(err)
 		}
+		fmt.Println("GNU pies stopped")
+		PiesStart()
 		fmt.Println("GNU pies restarted")
 	} else {
 		PiesStart()
@@ -657,11 +659,12 @@ func SetupAction(args []string) {
 	optset.SetParameters("")
 	make_config := false
 	optset.FlagLong(&make_config, "make-config", 0, "Create ghb.conf configuration file")
+	optset.FlagLong(&DefaultPiesPort, "port", 0, "Pies control port", "PORT")
 	optset.Parse()
 
 	args = optset.Args()
-	if len(args) != 1 {
-		log.Fatalf("required argument (your GitHub user name) missing; try `%s --help' for assistance", optset.Command)
+	if len(args) > 0 {
+		log.Fatalf("extra arguments; try `%s --help' for assistance", optset.Command)
 	}
 
 	ReadConfig()
@@ -713,7 +716,7 @@ func (tv *timeValue) Set(value string, opt getopt.Option) error {
 }
 
 func (tv *timeValue) String() string {
-	return time.Time(*tv).String()
+	return time.Time(*tv).Format(time.RFC3339)
 }
 
 func (tok GHToken) Print() {
@@ -736,7 +739,7 @@ func PatAction(args []string) {
 	optset := NewEntityOptset(args)
 	optset.SetParameters("")
 	var (
-		expiration timeValue
+		expiration = timeValue(time.Now().Add(time.Hour * 24 * 30))
 		token string
 		delete bool
 		all bool
@@ -771,36 +774,9 @@ func PatAction(args []string) {
 		}
 	} else {
 		exptime := time.Time(expiration)
-		if exptime.IsZero() {
-			exptime = time.Now().Add(time.Hour * 24 * 7)
-		}
 		tok := GHToken{Token: token, ExpiresAt: exptime}
 		if err := SaveToken(optset.Entity.PATKey(), tok); err != nil {
 			log.Fatal(err)
-		}
-	}
-}
-
-func TryAction(args []string) {
-	ReadConfig()
-	optset := NewEntityOptset(args)
-	optset.SetParameters("")
-	optset.Parse()
-
-	arch := runtime.GOARCH
-	if arch == "amd64" {
-		arch = "x64"
-	}
-	fmt.Printf("os: %s\n", runtime.GOOS)
-	fmt.Printf("arch: %s\n", arch)
-
-	res, err := GitHubGetDownloads(optset.Entity)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, dn := range res {
-		if dn.OS == runtime.GOOS && dn.Arch == arch {
-			fmt.Println(dn)
 		}
 	}
 }
@@ -838,7 +814,6 @@ func main() {
 				  Help: "Show a short help summary"},
 		"pat":     Action{Action: PatAction,
                                   Help: "Manage private access keys"},
-		"try":    Action{Action: TryAction, Help: "Dont use it, unless you know what you're doing"},
 	}
 
 	if len(os.Args) == 1 {
