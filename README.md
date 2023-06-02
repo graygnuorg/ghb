@@ -313,22 +313,6 @@ and
 ghb add --repo example proj
 ```
 
-This command verifies the current configuration.  Each configuration setting is printed on a separate line,
-along with its current value and status (`OK` or a diagnostic message describing the problem).  The program
-terminates with code 0 if the configuration is OK, or 1 if it is not.  E.g.:
-
-```sh
-$ ghb configcheck
-Verifying configuration
-  root_dir = "/home/gray/GHB": OK
-  runners_dir = "/home/gray/GHB/runners": OK
-  cache_dir = "/home/gray/GHB/cache": OK
-  tar = "tar": OK
-  pies = "pies": OK
-  pies_config_file = "/home/gray/GHB/pies.conf": OK
-  component_template = "component \"{{...": OK
-```
-
 Options:
 
 * `-g`, `--runnergroup=`_STRING_
@@ -352,6 +336,22 @@ Options:
   Display a short help summary and exit.
 
 ### `configcheck` - Check current configuration
+
+This command verifies the current configuration.  Each configuration setting is printed on a separate line,
+along with its current value and status (`OK` or a diagnostic message describing the problem).  The program
+terminates with code 0 if the configuration is OK, or 1 if it is not.  E.g.:
+
+```sh
+$ ghb configcheck
+Verifying configuration
+  root_dir = "/home/gray/GHB": OK
+  runners_dir = "/home/gray/GHB/runners": OK
+  cache_dir = "/home/gray/GHB/cache": OK
+  tar = "tar": OK
+  pies = "pies": OK
+  pies_config_file = "/home/gray/GHB/pies.conf": OK
+  component_template = "component \"{{...": OK
+```
 
 Options:
 
@@ -407,6 +407,7 @@ Displays a short command line usage summary and a list of available actions.
 
 ```sh
 gh list [OPTIONS]
+```
 
 This command lists configured runners:
 
